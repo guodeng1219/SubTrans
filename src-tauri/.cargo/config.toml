@@ -1,0 +1,13 @@
+# whisper-rs-sys 构建说明见下方。
+#
+# 说明：whisper-rs-sys 默认用 bindgen 现场生成 C 绑定，这在每个平台上
+# 都会生成与该平台匹配的正确绑定，是推荐做法。
+#
+# 不要在这里设置 WHISPER_DONT_GENERATE_BINDINGS=1 ——
+# 那会改用作者预生成的（Linux）绑定，在 Windows/macOS 上会因结构体
+# 尺寸不匹配而编译失败（_IO_FILE / _G_fpos_t overflow）。
+#
+# 正确做法：在打包机器上安装 LLVM 提供 libclang。
+#   Windows: winget install LLVM.LLVM
+#            $env:LIBCLANG_PATH="C:\Program Files\LLVM\bin"
+#   macOS:   Xcode Command Line Tools 已自带 libclang

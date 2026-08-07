@@ -1,0 +1,50 @@
+[package]
+name = "subtrans"
+version = "0.1.0"
+description = "本地视频翻译字幕工具"
+authors = ["you"]
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "subtrans_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 语音识别：whisper.cpp Rust 绑定（多语言通用引擎；中文/GPU 由 faster-whisper sidecar 提供）
+whisper-rs = "0.16"
+num_cpus = "1"
+
+# 异步运行时 + HTTP（翻译 API / 模型下载）
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+
+anyhow = "1"
+dirs = "5"
+hound = "3.5"          # WAV 读取（喂给 whisper）
+regex = "1"             # 字幕文本后处理
+
+[features]
+# 默认 CPU。需要 GPU 加速时按平台开启对应 feature 编译：
+#   metal  -> Apple Silicon
+#   cuda   -> NVIDIA
+default = []
+metal = ["whisper-rs/metal"]
+cuda = ["whisper-rs/cuda"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
