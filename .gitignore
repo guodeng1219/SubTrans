@@ -4,6 +4,7 @@ python/__pycache__/
 
 # Tauri sidecar binaries (auto-downloaded by build.rs)
 src-tauri/binaries/ffmpeg-*
+src-tauri/binaries/ffprobe-*
 
 # Tauri 构建生成的 schema（capabilities 引用的 gen/schemas）
 src-tauri/gen/
@@ -18,6 +19,7 @@ src-tauri/python-bundle/__pycache__/
 # Bundled models (auto-downloaded by build.rs, ~77MB)
 src-tauri/models/*.bin
 src-tauri/models/*.onnx
+src-tauri/models/*.rnnn
 
 # Rust build artifacts
 src-tauri/target/

@@ -6,6 +6,7 @@ mod ffmpeg;
 mod fw_ipc;
 mod ollama;
 mod python_setup;
+mod subtitle_parse;
 mod translate;
 
 use fw_ipc::FwState;
@@ -23,11 +24,13 @@ fn whisper_model_url(name: &str) -> String {
     format!("https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin")
 }
 
-/// Silero VAD 模型（~2MB，whisper.cpp 内置 VAD 用）
-const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.onnx";
+/// Silero VAD 模型（~2MB，whisper.cpp 内置 VAD 用）。
+/// 注意：whisper-rs 内置的 whisper.cpp 以 ggml 二进制格式加载 VAD 模型，
+/// 对应 ggml-org/whisper-vad 仓库的 .bin 文件（旧的 ggerganov/whisper.cpp .onnx 已下线且格式不符）。
+const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
 
 fn vad_model_url() -> &'static str {
-    "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-silero-v5.1.2.onnx"
+    "https://hf-mirror.com/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 }
 
 fn data_dir(app: &tauri::AppHandle) -> PathBuf {
@@ -55,6 +58,144 @@ fn vad_model_path(app: &tauri::AppHandle) -> PathBuf {
     data_dir(app).join(VAD_MODEL_FILE)
 }
 
+/// ffmpeg arnndn 滤镜用的 RNN 降噪模型（abstractive/arnndn-models，约 300KB）
+const ARNDNN_MODEL_FILE: &str = "cb.rnnn";
+
+fn arnndn_model_path(app: &tauri::AppHandle) -> PathBuf {
+    data_dir(app).join(ARNDNN_MODEL_FILE)
+}
+
+/// 确保 arnndn 降噪模型存在：优先内置（models/），否则运行时下载到 data_dir。
+async fn ensure_arnndn_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // 全局下载锁：串行化并消除 check-then-download 竞态
+    let _dl = MODEL_DL_LOCK.lock().await;
+    // 内置与本地缓存都校验体积，防止构建/上次下载留下的错误页被当模型用
+    if let Some(p) = bundled_model_path(app, ARNDNN_MODEL_FILE) {
+        if model_size_ok(&p, 250_000) {
+            return Ok(p);
+        }
+    }
+    let dest = arnndn_model_path(app);
+    if model_size_ok(&dest, 250_000) {
+        return Ok(dest);
+    }
+    let _ = std::fs::remove_file(&dest); // 清除半成品/损坏文件
+    let dir = data_dir(app);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(5 * 60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    // jsDelivr 镜像 GitHub 文件，国内一般可达；失败回退 GitHub raw
+    let urls = [
+        "https://cdn.jsdelivr.net/gh/abstractive/arnndn-models@master/cb.rnnn",
+        "https://raw.githubusercontent.com/abstractive/arnndn-models/master/cb.rnnn",
+    ];
+    let mut last_err = String::new();
+    for url in urls {
+        emit_progress(app, "denoise", 10.0, "下载 RNN 降噪模型（约 300KB）...");
+        match http_download(app, &client, url, &dest, "RNN 降噪模型", false).await {
+            Ok(true) => {
+                if model_size_ok(&dest, 250_000) {
+                    return Ok(dest);
+                }
+                let _ = std::fs::remove_file(&dest);
+                last_err = format!("下载内容异常（体积过小）({url})");
+            }
+            Ok(false) => last_err = format!("HTTP 错误 ({url})"),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!("下载 RNN 降噪模型失败: {last_err}"))
+}
+
+/// 校验模型名：只允许小写字母、数字、连字符。
+/// 模型名会参与本地文件路径（data_dir/ggml-{name}.bin）与下载 URL 的拼接，
+/// 白名单校验防止路径逃逸/URL 注入（前端下拉框本就是固定选项，这里兜底）。
+fn validate_model_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("无效的模型名: {name}"))
+    }
+}
+
+/// 解析术语表为「原文=译文」映射对（术语词典：对译文做确定性强制替换）。
+/// 兼容逗号/顿号/分号分隔与多行格式；无 = 的条目只作为识别热词，不产生映射。
+fn parse_glossary_mapping(glossary: &str) -> Vec<(String, String)> {
+    let mut map = Vec::new();
+    for line in glossary.lines() {
+        for part in line.split([',', '，', '、', ';', '；']) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = part.split_once('=') {
+                let (k, v) = (k.trim(), v.trim());
+                if !k.is_empty() && !v.is_empty() {
+                    map.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 提取术语表中的源词（映射对的键 + 无 = 的整词），作为 faster-whisper 识别热词。
+fn glossary_hotwords(glossary: &str) -> String {
+    let mut words = Vec::new();
+    for line in glossary.lines() {
+        for part in line.split([',', '，', '、', ';', '；']) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let word = match part.split_once('=') {
+                Some((k, _)) => k.trim(),
+                None => part,
+            };
+            if !word.is_empty() {
+                words.push(word);
+            }
+        }
+    }
+    words.join(" ")
+}
+
+/// 把术语映射确定性应用到译文（LLM/翻译引擎不听话时的兜底强制替换）。
+fn apply_glossary(text: &str, map: &[(String, String)]) -> String {
+    let mut out = text.to_string();
+    for (k, v) in map {
+        out = out.replace(k.as_str(), v.as_str());
+    }
+    out
+}
+
+/// 临时文件守护：作用域结束时删除文件。
+/// process_chunk 的临时 wav 在多个失败路径（模型下载失败、识别超时等）可能提前返回，
+/// 统一交给守护对象清理，避免 temp 里堆半成品。
+struct TempFileGuard(std::path::PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 临时目录守护：作用域结束时递归删除。
+/// 人声分离的工作目录可能含整段视频的音频（可达 GB 级），
+/// 任何成功/失败路径都必须清理。
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// 查找内置模型：优先 resource_dir/models/（打包内置），回退 data_dir（运行时下载）。
 fn bundled_model_path(app: &tauri::AppHandle, filename: &str) -> Option<PathBuf> {
     if let Ok(dir) = app.path().resource_dir() {
@@ -79,16 +220,31 @@ fn read_cuda_python_marker(app: &tauri::AppHandle) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 模型文件体积下限校验：下载错误页/中断半成品远小于真实模型，防止被当模型用。
+/// min 为各模型的实际下限（VAD ~885KB、cb.rnnn ~300KB）。
+fn model_size_ok(p: &std::path::Path, min: u64) -> bool {
+    p.metadata().map(|m| m.len() > min).unwrap_or(false)
+}
+
+/// 全局下载互斥锁：多个入口（分片并发、向导下载、降噪模型）可能同时下载同一文件，
+/// .part 固定命名下并发写会交错损坏；串行化所有模型下载，消除 check-then-download 竞态。
+static MODEL_DL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// 确保 VAD 模型存在：优先用内置的，否则下载到 data_dir。
 async fn ensure_vad_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // 优先用打包内置的 VAD 模型
+    let _dl = MODEL_DL_LOCK.lock().await; // 串行化下载，消除并发 .part 交错损坏
+                                          // 优先用打包内置的 VAD 模型（校验体积，防止构建时下载到的错误页被误用）
     if let Some(p) = bundled_model_path(app, VAD_MODEL_FILE) {
-        return Ok(p);
+        if model_size_ok(&p, 500_000) {
+            return Ok(p);
+        }
     }
     let dest = vad_model_path(app);
-    if dest.exists() {
+    if model_size_ok(&dest, 500_000) {
         return Ok(dest);
     }
+    let _ = std::fs::remove_file(&dest); // 清除半成品/损坏文件
     let dir = data_dir(app);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let client = reqwest::Client::builder()
@@ -109,6 +265,10 @@ async fn ensure_vad_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let part = dest.with_extension("part");
     std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
     std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
+    if !model_size_ok(&dest, 500_000) {
+        let _ = std::fs::remove_file(&dest);
+        return Err("下载的 VAD 模型文件异常（体积过小），请重试".into());
+    }
     Ok(dest)
 }
 
@@ -141,7 +301,10 @@ pub(crate) fn log_err(app: &tauri::AppHandle, tag: &str, err: &str) {
     }
     let log_file = log_dir.join("subtrans.log");
     if log_file.metadata().map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false) {
-        let _ = std::fs::remove_file(&log_file);
+        // 轮转而非直接删除：旧日志保留一份（subtrans.log.1），排障时不丢历史现场
+        let old = log_file.with_extension("log.1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&log_file, &old);
     }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
@@ -165,7 +328,16 @@ impl AsrCache {
         model_path: PathBuf,
         model_name: String,
     ) -> Result<Arc<WhisperEngine>, String> {
+        // 快路径：try_lock 命中缓存直接返回，不被冷加载中的其它请求阻塞
+        if let Ok(guard) = self.whisper.try_lock() {
+            if let Some((name, engine)) = guard.as_ref() {
+                if *name == model_name {
+                    return Ok(engine.clone());
+                }
+            }
+        }
         let mut guard = self.whisper.lock().await;
+        // 双检：等锁期间可能已被其它请求加载
         if let Some((name, engine)) = guard.as_ref() {
             if *name == model_name {
                 return Ok(engine.clone());
@@ -202,6 +374,8 @@ async fn download_model(app: tauri::AppHandle, name: String) -> Result<String, S
 async fn download_model_inner(app: tauri::AppHandle, name: String) -> Result<String, String> {
     use futures_util::StreamExt;
 
+    validate_model_name(&name)?;
+    let _dl = MODEL_DL_LOCK.lock().await; // 与 process_chunk 并发下载同一模型时串行化
     let dir = data_dir(&app);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let dest = whisper_model_path(&app, &name);
@@ -287,7 +461,8 @@ pub(crate) fn fw_model_root() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("subtrans-models")
 }
 
-/// 在所有已知根目录里找已下载好的 fw 模型（以 model.bin 存在为准）。
+/// 在所有已知根目录里找已下载好的 fw 模型：model.bin 体积达标 + 必需伴随文件齐备
+/// 才算完整（只查 model.bin 存在会把半成品当完整模型永久缓存）。
 fn fw_model_dir_existing(name: &str) -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(v) = std::env::var("SUBTRANS_MODELS") {
@@ -298,7 +473,11 @@ fn fw_model_dir_existing(name: &str) -> Option<PathBuf> {
     roots.push(fw_model_root());
     for root in roots {
         let d = root.join(format!("faster-whisper-{name}"));
-        if d.join("model.bin").is_file() {
+        if d.join("model.bin").is_file()
+            && d.join("model.bin").metadata().map(|m| m.len() > 10_000_000).unwrap_or(false)
+            && d.join("config.json").is_file()
+            && d.join("tokenizer.json").is_file()
+        {
             return Some(d);
         }
     }
@@ -363,6 +542,7 @@ async fn http_download(
 /// 小文件先下、model.bin 最后下——fw_server 以 model.bin 存在为"本地完整"标志，
 /// 这样中断的下载不会被误判成完整模型。
 async fn ensure_fw_model(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let _dl = MODEL_DL_LOCK.lock().await; // 并发分片同时缺模型时只让一个真正下载
     if fw_model_dir_existing(name).is_some() {
         return Ok(());
     }
@@ -487,6 +667,7 @@ async fn process_chunk(
     fw_python: String,
     fw_device: String,
     vad_enabled: bool,
+    denoise_filter: String,
 ) -> Result<ChunkResult, String> {
     let res = process_chunk_inner(
         app.clone(),
@@ -510,6 +691,7 @@ async fn process_chunk(
         fw_python,
         fw_device,
         vad_enabled,
+        denoise_filter,
     )
     .await;
     if let Err(e) = &res {
@@ -541,10 +723,35 @@ async fn process_chunk_inner(
     fw_python: String,
     fw_device: String,
     vad_enabled: bool,
+    denoise_filter: String,
 ) -> Result<ChunkResult, String> {
     use futures_util::stream::StreamExt;
 
     let engine_label = if use_fw { "faster-whisper" } else { "whisper" };
+    // 模型名参与本地文件路径（whisper 模型 / faster-whisper 模型目录）与下载 URL 拼接，
+    // 先白名单校验防路径逃逸
+    validate_model_name(&model_name)?;
+    // 降噪滤镜白名单：只允许固定值，防注入 ffmpeg 滤镜参数（返回 'static 便于移进闭包）
+    let denoise_filter: &'static str = match denoise_filter.as_str() {
+        "none" | "" => "none",
+        "afftdn" => "afftdn",
+        "anlmdn" => "anlmdn",
+        "arnndn" => "arnndn",
+        other => return Err(format!("无效的降噪滤镜: {other}")),
+    };
+    // 数值入参边界校验：NaN/负值/超大值会流入 ffmpeg 参数与临时文件名，直接拒绝
+    if !start_sec.is_finite()
+        || !duration_sec.is_finite()
+        || !lead_in_sec.is_finite()
+        || !total_sec.is_finite()
+        || start_sec < 0.0
+        || duration_sec <= 0.0
+        || lead_in_sec < 0.0
+        || total_sec < 0.0
+        || duration_sec > 24.0 * 3600.0
+    {
+        return Err("无效的时间参数（start/duration/lead_in/total）".into());
+    }
     // GPU 路径要起 Python 子进程，先校验路径；空参数 → 自动用 bundled Python
     let fw_python = if fw_python.is_empty() { resolve_python(&app) } else { fw_python };
     if use_fw {
@@ -558,6 +765,9 @@ async fn process_chunk_inner(
 
     // 1) 抽取音频
     let t_ex = std::time::Instant::now();
+    // arnndn 需要模型文件：使用前确保已下载（内置/已有则秒回）
+    let arnndn_model =
+        if denoise_filter == "arnndn" { Some(ensure_arnndn_model(&app).await?) } else { None };
     // 临时文件带时间戳后缀：切换视频/并发请求时同一 start 不会互相覆盖
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -572,29 +782,22 @@ async fn process_chunk_inner(
     // 高精度模式下从分离好的人声轨取音；否则直接取原视频
     let asr_src = audio_source.as_deref().unwrap_or(video_path.as_str());
     let ffmpeg_bin = resolve_ffmpeg(&app);
-    // ffmpeg 是阻塞子进程，放进 spawn_blocking，避免占住 async runtime 的 worker
-    let (asr_src_owned, tmp_owned, ffmpeg_owned) =
-        (asr_src.to_string(), tmp.clone(), ffmpeg_bin.clone());
-    // 所有失败路径都删掉临时 wav，避免 temp 里堆半成品（成功时文件还要给 ASR 用，不能删）
+    // 异步子进程 + kill_on_drop：超时丢弃 future 时 ffmpeg 被立刻杀死，不留孤儿进程
     let extract_result = tokio::time::timeout(
         std::time::Duration::from_secs(180),
-        tokio::task::spawn_blocking(move || {
-            ffmpeg::extract_audio_range(
-                &asr_src_owned,
-                &tmp_owned,
-                &ffmpeg_owned,
-                real_start,
-                real_dur,
-            )
-        }),
+        ffmpeg::extract_audio_range(
+            asr_src,
+            &tmp,
+            &ffmpeg_bin,
+            real_start,
+            real_dur,
+            denoise_filter,
+            arnndn_model.as_deref(),
+        ),
     )
     .await;
     match extract_result {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.to_string());
-        }
+        Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.to_string());
@@ -604,12 +807,26 @@ async fn process_chunk_inner(
             return Err("抽取音频超时（180s），请检查视频文件或 ffmpeg".to_string());
         }
     }
+    // 提取成功后由守护对象统一负责删除临时 wav：后续任何 `?` 提前返回
+    //（fw 模型下载失败、识别超时、翻译失败等）都不会在 temp 里留下半成品。
+    let _tmp_guard = TempFileGuard(tmp.clone());
     let extract_ms = t_ex.elapsed().as_millis() as u64;
 
     // 2) 识别
     let t_tr = std::time::Instant::now();
     let src_owned: Option<String> = source_lang.filter(|s| s != "auto");
     let offset = real_start;
+
+    // 术语词典：映射对用于译文强制替换；源词作为 faster-whisper 热词（截断防超长）
+    let glossary_map = parse_glossary_mapping(&glossary);
+    let hotwords = {
+        let keys = glossary_hotwords(&glossary);
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.chars().take(200).collect::<String>())
+        }
+    };
 
     let mut vad_warn: Option<String> = None;
     let mut detected_lang: Option<String> = None;
@@ -620,13 +837,6 @@ async fn process_chunk_inner(
         let tmp_str = tmp.to_string_lossy().to_string();
         ensure_fw_model(&app, &model_name).await?;
         fw_ipc::fw_ensure(&fw_state, &fw_python, &model_name, &fw_device, &app).await?;
-        // 术语表同时作为 faster-whisper 热词（截断防超长），人名/专有名词识别更准
-        let hotwords = glossary.trim();
-        let hotwords = if hotwords.is_empty() {
-            None
-        } else {
-            Some(hotwords.chars().take(200).collect::<String>())
-        };
         let transcribe = fw_ipc::fw_transcribe_one(
             &fw_state,
             &tmp_str,
@@ -636,7 +846,6 @@ async fn process_chunk_inner(
             hotwords.as_deref(),
         )
         .await;
-        let _ = std::fs::remove_file(&tmp);
         let detected = transcribe?;
         detected_lang = detected.language;
         detected_lang_probability = detected.language_probability;
@@ -656,7 +865,6 @@ async fn process_chunk_inner(
             tokio::task::spawn_blocking(move || ffmpeg::read_wav_as_f32(&tmp2)),
         )
         .await;
-        let _ = std::fs::remove_file(&tmp);
         let audio: Vec<f32> = read_result
             .map_err(|_| "读取音频超时（30s）".to_string())?
             .map_err(|e| e.to_string())?
@@ -708,7 +916,11 @@ async fn process_chunk_inner(
     }
 
     // 2.5) 可选：LLM 同音字校对（按上下文整批修正后再翻译）
-    let mut warn: Option<String> = vad_warn;
+    // 告警聚合成列表：VAD 降级/纠错失败/翻译失败都保留，不再互相覆盖
+    let mut warns: Vec<String> = Vec::new();
+    if let Some(w) = vad_warn {
+        warns.push(w);
+    }
     let t_co = std::time::Instant::now();
     if correct_enabled {
         if let Some(ce) = &correct_engine {
@@ -721,7 +933,7 @@ async fn process_chunk_inner(
                             seg.text = t;
                         }
                     }
-                    Err(e) => warn = Some(format!("纠错失败: {e}")),
+                    Err(e) => warns.push(format!("纠错失败: {e}")),
                 }
             }
         }
@@ -734,7 +946,14 @@ async fn process_chunk_inner(
         let client = Arc::new(reqwest::Client::new());
         let engine = Arc::new(engine);
         let target = Arc::new(target_lang);
-        let src_lang: Arc<Option<String>> = Arc::new(src_owned.clone());
+        // 翻译源语言：用户指定 > faster-whisper 检测结果（置信度足够时）> 引擎自行推断。
+        // 免费引擎(MyMemory)不支持 auto 且按字符启发式猜 zh/en，日文纯假名会被误判成中文，
+        // 因此优先采用模型检测到的语言码。
+        let effective_src = src_owned.clone().or_else(|| {
+            let prob = detected_lang_probability.unwrap_or(1.0);
+            detected_lang.clone().filter(|_| prob >= 0.5)
+        });
+        let src_lang: Arc<Option<String>> = Arc::new(effective_src);
         let seg_count = segments.len();
         // Ollama 本地模型并发能力有限，给 2；DeepSeek/免费 API 可承受更高并发
         let cap = if matches!(*engine, translate::Engine::Ollama { .. }) { 2 } else { 6 };
@@ -742,6 +961,10 @@ async fn process_chunk_inner(
         // 翻译失败计数：失败时 translated 留空（前端会回退显示原文），
         // 避免把错误字符串塞进字幕内容污染 SRT 导出和 overlay 显示。
         let fail_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // 记录首个翻译错误详情（脱敏后进日志），前端只显示计数
+        let first_err: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let gmap: Arc<Vec<(String, String)>> = Arc::new(glossary_map.clone());
         let out_vec: Vec<OutSegment> = futures_util::stream::iter(segments)
             .map(|seg| {
                 let client = client.clone();
@@ -749,6 +972,8 @@ async fn process_chunk_inner(
                 let target = target.clone();
                 let fail_count = fail_count.clone();
                 let src_lang = src_lang.clone();
+                let gmap = gmap.clone();
+                let first_err = first_err.clone();
                 async move {
                     let translated = match translate::translate(
                         &client,
@@ -759,9 +984,13 @@ async fn process_chunk_inner(
                     )
                     .await
                     {
-                        Ok(t) => t,
-                        Err(_e) => {
+                        Ok(t) => apply_glossary(&t, &gmap),
+                        Err(e) => {
                             fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut fe = first_err.lock().unwrap();
+                            if fe.is_none() {
+                                *fe = Some(e.to_string());
+                            }
                             String::new()
                         }
                     };
@@ -779,7 +1008,10 @@ async fn process_chunk_inner(
             .await;
         let fails = fail_count.load(std::sync::atomic::Ordering::Relaxed);
         if fails > 0 {
-            warn = Some(format!("翻译失败 {fails}/{seg_count} 条（已回退显示原文）"));
+            warns.push(format!("翻译失败 {fails}/{seg_count} 条（已回退显示原文）"));
+            if let Some(e) = first_err.lock().unwrap().take() {
+                log_err(&app, "translate", &e);
+            }
         }
         out_vec
     } else {
@@ -796,6 +1028,7 @@ async fn process_chunk_inner(
     };
     let translate_ms = t_tx.elapsed().as_millis() as u64;
 
+    let warn = if warns.is_empty() { None } else { Some(warns.join("；")) };
     Ok(ChunkResult {
         segments: out,
         extract_ms,
@@ -819,7 +1052,7 @@ async fn fw_check(app: tauri::AppHandle, python_exe: String) -> Result<String, S
         "-c",
         "import torch, faster_whisper; print('faster-whisper OK | torch', torch.__version__, '| CUDA', torch.cuda.is_available())",
     ]);
-    command.env("PYTHONUTF8", "1");
+    command.env("PYTHONUTF8", "1").kill_on_drop(true);
     #[cfg(target_os = "windows")]
     {
         command.creation_flags(0x0800_0000);
@@ -974,6 +1207,7 @@ async fn test_python_bin(path_or_name: &str) -> Option<String> {
     cmd.args(["-c", "import sys; print(sys.executable); print(sys.version.split()[0])"])
         // 日文 locale 下 python 管道默认 cp932，会把含「南山」的路径解坏（南山→??R）；强制 UTF-8
         .env("PYTHONUTF8", "1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]
@@ -1004,6 +1238,7 @@ async fn get_python_version(python: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new(python);
     cmd.args(["-c", "import sys; print(sys.version.split()[0])"])
         .env("PYTHONUTF8", "1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]
@@ -1026,6 +1261,7 @@ async fn check_python_packages(python: &str) -> (bool, bool, bool) {
     let mut cmd = tokio::process::Command::new(python);
     cmd.args(["-c", script])
         .env("PYTHONUTF8", "1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]
@@ -1086,7 +1322,7 @@ async fn demucs_check(app: tauri::AppHandle, python_exe: String) -> Result<Strin
         // bundle 里 audio_separator 无 dist-info，也没有 __version__ 属性，只验证可导入即可
         "import audio_separator; print('audio-separator OK')",
     ]);
-    command.env("PYTHONUTF8", "1");
+    command.env("PYTHONUTF8", "1").kill_on_drop(true);
     #[cfg(target_os = "windows")]
     {
         command.creation_flags(0x0800_0000);
@@ -1104,7 +1340,7 @@ async fn demucs_check(app: tauri::AppHandle, python_exe: String) -> Result<Strin
         "-c",
         "import torch, demucs; print('demucs OK | torch', torch.__version__, '| CUDA', torch.cuda.is_available())",
     ]);
-    command2.env("PYTHONUTF8", "1");
+    command2.env("PYTHONUTF8", "1").kill_on_drop(true);
     #[cfg(target_os = "windows")]
     {
         command2.creation_flags(0x0800_0000);
@@ -1154,33 +1390,41 @@ async fn separate_vocals_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    // 清理本进程之前留下的 vocals 文件（每次分离只保留最新一份，避免 temp 堆大文件）
+    // 清理人声轨残留：本进程旧文件立即清；其它进程（上次运行）遗留的只清 24h 以上陈旧的，
+    // 避免误删另一个正在运行实例正在使用的文件。
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-        let prefix = format!("subtrans_vocals_{}_", std::process::id());
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && name.ends_with(".wav") {
+            if !name.starts_with("subtrans_vocals_") || !name.ends_with(".wav") {
+                continue;
+            }
+            let is_ours = name.starts_with(&format!("subtrans_vocals_{}_", std::process::id()));
+            let stale =
+                entry.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false);
+            if is_ours || stale {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
     }
     let work = std::env::temp_dir().join(format!("subtrans_sep_{}_{}", std::process::id(), stamp));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    // 工作目录含整段视频的音频（可达 GB 级），由守护对象统一清理：
+    // 提取失败 / 分离失败 / 超时 / 成功等所有路径都不在 temp 里堆积大文件。
+    let _work_guard = TempDirGuard(work.clone());
     let audio = work.join("audio.wav");
     let vocals_dest =
         std::env::temp_dir().join(format!("subtrans_vocals_{}_{}.wav", std::process::id(), stamp));
 
-    // 1) 提取整段音频（44.1k 立体声）
+    // 1) 提取整段音频（44.1k 立体声）——异步子进程 + kill_on_drop，超时即杀
     emit_progress(&app, "separate", 3.0, "提取音频中...");
     let ffmpeg_bin = resolve_ffmpeg(&app);
-    let (vp, fb, ap) = (video_path.clone(), ffmpeg_bin, audio.clone());
     tokio::time::timeout(
         std::time::Duration::from_secs(10 * 60),
-        tokio::task::spawn_blocking(move || ffmpeg::extract_audio_full(&vp, &ap, &fb)),
+        ffmpeg::extract_audio_full(&video_path, &audio, &ffmpeg_bin),
     )
     .await
     .map_err(|_| "提取整段音频超时（10 分钟），请检查视频文件".to_string())?
-    .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
 
     // 2) 检测用哪个分离引擎：demucs 系模型名走 demucs；
@@ -1214,19 +1458,24 @@ async fn separate_vocals_inner(
             model.clone()
         };
         // bundle 里 audio_separator 没有 dist-info，CLI 入口（console script / -m）都会挂；
-        // 直接用 Separator API 直调，不依赖命令行解析和包元数据
-        let script = format!(
-            "from audio_separator.separator import Separator\n\
-             sep = Separator(model_file_dir=r'{mdir}', output_dir=r'{odir}', output_format='WAV')\n\
-             sep.load_model(model_filename=r'{model}')\n\
-             files = sep.separate([r'{audio}'])\n\
-             print('OK', files)",
-            mdir = sep_models_dir.display(),
-            odir = out_dir.display(),
-            model = sep_model,
-            audio = audio.display(),
+        // 直接用 Separator API 直调，不依赖命令行解析和包元数据。
+        // 路径一律经 argv（sys.argv[1..]）传入，绝不拼接进 Python 源码：
+        // 路径含单引号（如 O'Neil.mp4 / D:\Users\D'Artagnan\...）时拼接会直接语法错误。
+        let script = concat!(
+            "import sys\n",
+            "from audio_separator.separator import Separator\n",
+            "sep = Separator(model_file_dir=sys.argv[1], output_dir=sys.argv[2], output_format='WAV')\n",
+            "sep.load_model(model_filename=sys.argv[3])\n",
+            "files = sep.separate([sys.argv[4]])\n",
+            "print('OK', files)",
         );
-        command.arg("-c").arg(&script);
+        command
+            .arg("-c")
+            .arg(script)
+            .arg(&sep_models_dir)
+            .arg(&out_dir)
+            .arg(&sep_model)
+            .arg(&audio);
         if device == "cpu" {
             // audio-separator CLI 没有 --cpu 参数（argparse 会直接报错）；
             // 用 CUDA_VISIBLE_DEVICES 清空让 torch.cuda.is_available() 为 false，
@@ -1310,7 +1559,6 @@ async fn separate_vocals_inner(
             Ok(s) => s.map_err(|e| e.to_string())?,
             Err(_) => {
                 let _ = child.kill().await;
-                let _ = std::fs::remove_dir_all(&work);
                 return Err("人声分离超时（2 小时），已终止进程".to_string());
             }
         };
@@ -1322,7 +1570,6 @@ async fn separate_vocals_inner(
             let t = tail.lock().unwrap();
             t.iter().cloned().collect::<Vec<_>>().join(" | ")
         };
-        let _ = std::fs::remove_dir_all(&work);
         return Err(format!("人声分离失败（退出码 {:?}）：{detail}", status.code()));
     }
 
@@ -1332,7 +1579,6 @@ async fn separate_vocals_inner(
         match find_vocals_in_dir(&out_dir) {
             Some(p) => p,
             None => {
-                let _ = std::fs::remove_dir_all(&work);
                 return Err(format!("未找到分离结果（在 {} 中）", out_dir.display()));
             }
         }
@@ -1340,17 +1586,12 @@ async fn separate_vocals_inner(
         // demucs 输出: out/{model}/audio/vocals.wav
         let p = out_dir.join(&demucs_model).join("audio").join("vocals.wav");
         if !p.exists() {
-            let _ = std::fs::remove_dir_all(&work);
             return Err(format!("未找到分离结果: {}", p.display()));
         }
         p
     };
-    // 复制到工作目录之外的稳定路径，然后清理工作目录（避免 temp 里堆整段音频）
-    std::fs::copy(&vocals, &vocals_dest).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&work);
-        format!("保存人声轨失败: {e}")
-    })?;
-    let _ = std::fs::remove_dir_all(&work);
+    // 复制到工作目录之外的稳定路径，然后清理工作目录（守护对象在函数结束时删除）
+    std::fs::copy(&vocals, &vocals_dest).map_err(|e| format!("保存人声轨失败: {e}"))?;
     emit_progress(&app, "separate", 100.0, "人声分离完成");
     Ok(vocals_dest.to_string_lossy().to_string())
 }
@@ -1360,6 +1601,7 @@ async fn check_audio_separator(python_exe: &str) -> bool {
     let mut cmd = tokio::process::Command::new(python_exe);
     cmd.args(["-c", "import audio_separator"])
         .env("PYTHONUTF8", "1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]
@@ -1382,6 +1624,405 @@ fn find_vocals_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ── 项目保存 / 自动保存 ──
+
+/// 自动保存文件路径：data_dir/autosave.json（会话草稿，与用户显式保存的项目文件分开）。
+fn autosave_path(app: &tauri::AppHandle) -> PathBuf {
+    data_dir(app).join("autosave.json")
+}
+
+/// 自动保存项目草稿（视频路径 + 设置 + 字幕）。先写 .tmp 再改名，防中断写坏文件。
+#[tauri::command]
+fn save_autosave(app: tauri::AppHandle, json: String) -> Result<(), String> {
+    let dest = autosave_path(&app);
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = dest.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 读取自动保存的草稿；不存在返回 None，损坏则删除并返回 None（不让坏文件反复报错）。
+#[tauri::command]
+fn load_autosave(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
+    let p = autosave_path(&app);
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    match serde_json::from_str(&text) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => {
+            let _ = std::fs::remove_file(&p);
+            Ok(None)
+        }
+    }
+}
+
+/// 用户显式保存项目文件（.subtrans / .json）。与 save_text_file 同样做路径校验。
+#[tauri::command]
+fn save_project_file(path: String, json: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() {
+        return Err("保存路径必须是绝对路径".into());
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if !matches!(ext.as_str(), "subtrans" | "json") {
+        return Err(format!("不支持的项目文件类型: .{ext}（仅支持 subtrans/json）"));
+    }
+    std::fs::write(p, json.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 打开项目文件并解析为 JSON。
+#[tauri::command]
+fn open_project_file(path: String) -> Result<serde_json::Value, String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() {
+        return Err("路径必须是绝对路径".into());
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if !matches!(ext.as_str(), "subtrans" | "json") {
+        return Err(format!("不支持的项目文件类型: .{ext}（仅支持 subtrans/json）"));
+    }
+    let text = std::fs::read_to_string(p).map_err(|e| format!("读取项目失败: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("项目文件解析失败: {e}"))
+}
+
+// ── 导入字幕 / 硬字幕烧录 ──
+
+/// 解析 ffprobe 路径：生产环境用 sidecar（与 exe 同级），开发环境回退 PATH。
+fn resolve_ffprobe(app: &tauri::AppHandle) -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar = dir.join("ffprobe.exe");
+            if sidecar.exists() {
+                return sidecar.to_string_lossy().to_string();
+            }
+        }
+    }
+    if let Ok(dir) = app.path().resource_dir() {
+        let bundled = dir.join("ffprobe.exe");
+        if bundled.exists() {
+            return bundled.to_string_lossy().to_string();
+        }
+    }
+    "ffprobe".to_string()
+}
+
+/// 视频基本信息（分辨率/帧率/编码/大小），ffprobe 读取。
+#[derive(Serialize, Default)]
+struct VideoInfo {
+    ok: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<f64>,
+    duration_sec: Option<f64>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    size_mb: Option<f64>,
+}
+
+#[tauri::command]
+async fn video_info(app: tauri::AppHandle, video_path: String) -> Result<VideoInfo, String> {
+    let ffprobe = resolve_ffprobe(&app);
+    let mut cmd = tokio::process::Command::new(&ffprobe);
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x0800_0000); // tokio Command 自带该方法
+    }
+    cmd.args(["-v", "error", "-show_streams", "-show_format", "-of", "json", &video_path])
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| "读取视频信息超时（60s）".to_string())?
+        .map_err(|e| format!("运行 ffprobe 失败: {e}（请确认已安装 ffmpeg/ffprobe）"))?;
+    if !out.status.success() {
+        return Ok(VideoInfo::default());
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("解析 ffprobe 输出失败: {e}"))?;
+    let mut info = VideoInfo { ok: true, ..Default::default() };
+    if let Some(streams) = v["streams"].as_array() {
+        for s in streams {
+            if s["codec_type"].as_str() == Some("video") && info.width.is_none() {
+                info.width = s["width"].as_u64().map(|x| x as u32);
+                info.height = s["height"].as_u64().map(|x| x as u32);
+                info.video_codec = s["codec_name"].as_str().map(String::from);
+                // avg_frame_rate 形如 "30000/1001"
+                info.fps = s["avg_frame_rate"].as_str().and_then(|r| r.split_once('/')).and_then(
+                    |(a, b)| {
+                        let a: f64 = a.trim().parse().ok()?;
+                        let b: f64 = b.trim().parse().ok()?;
+                        if b > 0.0 {
+                            Some(a / b)
+                        } else {
+                            None
+                        }
+                    },
+                );
+            } else if s["codec_type"].as_str() == Some("audio") && info.audio_codec.is_none() {
+                info.audio_codec = s["codec_name"].as_str().map(String::from);
+            }
+        }
+    }
+    info.duration_sec = v["format"]["duration"].as_str().and_then(|d| d.parse().ok());
+    info.size_mb =
+        v["format"]["size"].as_str().and_then(|s| s.parse::<f64>().ok()).map(|b| b / 1e6);
+    Ok(info)
+}
+
+/// 解析 SRT/VTT 字幕文件为条目列表（导入现有字幕用）。
+#[tauri::command]
+fn parse_subtitle_file(path: String) -> Result<Vec<subtitle_parse::ParsedSubtitle>, String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() {
+        return Err("路径必须是绝对路径".into());
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let text = std::fs::read_to_string(p).map_err(|e| format!("读取字幕文件失败: {e}"))?;
+    let mut subs = subtitle_parse::parse_subtitle_file_ext(&ext, &text)?;
+    if subs.is_empty() {
+        return Err("字幕文件里没有解析到任何条目".into());
+    }
+    subs.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(subs)
+}
+
+/// 简体→繁体转换器（纯 Rust 实现，字典内嵌，离线可用，懒加载）。
+static OPENCC_S2T: std::sync::LazyLock<Option<ferrous_opencc::OpenCC>> =
+    std::sync::LazyLock::new(|| {
+        ferrous_opencc::OpenCC::from_config(ferrous_opencc::config::BuiltinConfig::S2t).ok()
+    });
+
+/// 简体 → 繁体（导出繁体字幕用）。
+#[tauri::command]
+fn convert_traditional(text: String) -> Result<String, String> {
+    match OPENCC_S2T.as_ref() {
+        Some(cc) => Ok(cc.convert(&text)),
+        None => Err("繁体转换组件初始化失败".into()),
+    }
+}
+
+/// 翻译单条文本（翻译现有字幕/单条重译用），并应用术语词典强制替换。
+#[tauri::command]
+async fn translate_text(
+    text: String,
+    target_lang: String,
+    engine: Engine,
+    source_lang: Option<String>,
+    glossary: String,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let map = parse_glossary_mapping(&glossary);
+    let t = translate::translate(&client, &engine, &text, &target_lang, source_lang.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(apply_glossary(&t, &map))
+}
+
+/// 波形数据：前端 canvas 绘制用（f32 原始样本的 base64）。
+#[derive(Serialize)]
+struct WaveformData {
+    sample_rate: u32,
+    samples_b64: String,
+    duration_sec: f64,
+}
+
+/// 提取视频音频波形（100Hz 单声道 f32 原始采样，base64 返回）。
+/// 只用于显示波形定位字幕，抽样率低所以长视频也很快。
+#[tauri::command]
+async fn extract_waveform(
+    app: tauri::AppHandle,
+    video_path: String,
+) -> Result<WaveformData, String> {
+    let ffmpeg_bin = resolve_ffmpeg(&app);
+    use base64::Engine;
+    let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x0800_0000); // tokio Command 自带该方法
+    }
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-i",
+        &video_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "100",
+        "-f",
+        "f32le",
+        "-",
+    ])
+    .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10 * 60), cmd.output())
+        .await
+        .map_err(|_| "提取波形超时（10 分钟）".to_string())?
+        .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+    if !out.status.success() {
+        let tail = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("提取波形失败: {}", tail.lines().next_back().unwrap_or("未知错误")));
+    }
+    let samples_b64 = base64::engine::general_purpose::STANDARD.encode(&out.stdout);
+    let duration_sec = out.stdout.len() as f64 / 4.0 / 100.0;
+    Ok(WaveformData { sample_rate: 100, samples_b64, duration_sec })
+}
+
+/// 把 SRT 内容烧录进视频导出（硬字幕）。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri 命令参数由前端按名传入，拆结构体会牵动前端
+async fn burn_subtitles(
+    app: tauri::AppHandle,
+    video_path: String,
+    srt_content: String,
+    out_path: String,
+    font_size: u32,
+    margin_v: u32,
+    position: String,
+    total_sec: f64,
+    preset: String,
+    font_color: String,
+    outline_color: String,
+) -> Result<String, String> {
+    let res = burn_subtitles_inner(
+        app.clone(),
+        video_path,
+        srt_content,
+        out_path,
+        font_size,
+        margin_v,
+        position,
+        total_sec,
+        preset,
+        font_color,
+        outline_color,
+    )
+    .await;
+    if let Err(e) = &res {
+        log_err(&app, "burn_subtitles", e);
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)] // 与上层 Tauri 命令参数一一对应
+async fn burn_subtitles_inner(
+    app: tauri::AppHandle,
+    video_path: String,
+    srt_content: String,
+    out_path: String,
+    font_size: u32,
+    margin_v: u32,
+    position: String,
+    total_sec: f64,
+    preset: String,
+    font_color: String,
+    outline_color: String,
+) -> Result<String, String> {
+    // 位置白名单校验（预设会覆盖，但仍需保证传入值合法）
+    let alignment: u32 = match position.as_str() {
+        "bottom" => 2,
+        "top" => 8,
+        "middle" => 5,
+        other => return Err(format!("无效的字幕位置: {other}")),
+    };
+    // 烧录预设：抖音 = 竖屏转换 + 大字幕；B站/YouTube = 横屏安全区字号
+    let (font_size, margin_v, alignment, extra_vf): (u32, u32, u32, &'static str) =
+        match preset.as_str() {
+            "douyin" => (
+                28,
+                160,
+                2,
+                "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            ),
+            "bilibili" => (20, 32, 2, ""),
+            "youtube" => (18, 36, 2, ""),
+            _ => (font_size.clamp(12, 96), margin_v.clamp(0, 400), alignment, ""),
+        };
+    // ASS 颜色为 &HAABBGGRR（BGR 顺序）
+    let font_color = match font_color.as_str() {
+        "white" => "&H00FFFFFF",
+        "yellow" => "&H0000E8FF",
+        "cyan" => "&H00C6D038",
+        "pink" => "&H00B469FF",
+        other => return Err(format!("无效的字幕颜色: {other}")),
+    };
+    let outline_color = match outline_color.as_str() {
+        "black" => "&H00000000",
+        "white" => "&H00FFFFFF",
+        other => return Err(format!("无效的描边颜色: {other}")),
+    };
+    let out = std::path::Path::new(&out_path);
+    if !out.is_absolute() {
+        return Err("输出路径必须是绝对路径".into());
+    }
+    let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    // libx264/aac 与 webm 容器不兼容（webm 仅支持 VP8/VP9/AV1 + Vorbis/Opus），不放入白名单
+    if !matches!(ext.as_str(), "mp4" | "mkv" | "mov") {
+        return Err(format!("不支持的输出格式: .{ext}（仅支持 mp4/mkv/mov）"));
+    }
+
+    // SRT 写入临时工作目录（文件名固定，滤镜图不接触用户路径）
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("subtrans_burn_{}_{}", std::process::id(), stamp));
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let _work_guard = TempDirGuard(work.clone());
+    let srt_path = work.join("subs.srt");
+    std::fs::write(&srt_path, srt_content.as_bytes()).map_err(|e| e.to_string())?;
+
+    let ffmpeg_bin = resolve_ffmpeg(&app);
+    emit_progress(&app, "burn", 0.0, "烧录字幕中（重新编码视频，请耐心等待）...");
+    // 异步烧录 + tokio channel 进度：无阻塞轮询，超时丢弃 future 即杀死 ffmpeg（kill_on_drop）
+    tokio::time::timeout(std::time::Duration::from_secs(4 * 3600), async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+        let burn_fut = ffmpeg::burn_subtitles(
+            &video_path,
+            &srt_path,
+            &out_path,
+            &ffmpeg_bin,
+            font_size,
+            margin_v,
+            alignment,
+            font_color,
+            outline_color,
+            extra_vf,
+            total_sec,
+            tx,
+        );
+        tokio::pin!(burn_fut);
+        let mut done: Option<Result<(), String>> = None;
+        while done.is_none() {
+            tokio::select! {
+                pct = rx.recv() => {
+                    if let Some(p) = pct {
+                        emit_progress(
+                            &app,
+                            "burn",
+                            p,
+                            &format!("烧录字幕中... {p:.0}%（重新编码视频）"),
+                        );
+                    }
+                }
+                r = &mut burn_fut => {
+                    done = Some(r.map_err(|e| e.to_string()));
+                }
+            }
+        }
+        done.unwrap()
+    })
+    .await
+    .map_err(|_| "烧录超时（4 小时）".to_string())??;
+    emit_progress(&app, "burn", 100.0, "字幕烧录完成");
+    Ok(out_path)
 }
 
 /// 把文本写到指定路径（导出 SRT 用）。走后端 std::fs，绕过 fs 插件 scope 限制——
@@ -1419,7 +2060,12 @@ async fn ollama_pull(
     host: Option<String>,
     model: String,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    // 流式超时（2h，在 ollama::pull_model 内）只覆盖数据读取阶段；
+    // 连接建立默认靠系统 TCP 超时可能挂数分钟，这里显式给 10s 快速失败。
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
     ollama::pull_model(&client, host.as_deref(), &model, |pct, status| {
         emit_progress(&app, "ollama_pull", pct, &format!("拉取模型: {status}"));
     })
@@ -1569,6 +2215,14 @@ async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result
     if python_exe.is_empty() {
         return Err("未找到 Python 路径".into());
     }
+    #[cfg(target_os = "macos")]
+    {
+        // cu124 轮子没有 macOS 版：此命令在 macOS 上必然失败，直接给出明确提示，
+        // 而不是走完三个镜像后报"回退 CPU 版"误导用户
+        return Err(
+            "当前平台不支持一键安装 CUDA 版 torch（仅 Windows/Linux 提供 cu124 镜像）".into()
+        );
+    }
     // 确保 pip 可用（embeddable/精简 Python 可能没装 pip）
     python_setup::ensure_pip(std::path::Path::new(&python_exe), &std::env::temp_dir()).await?;
 
@@ -1578,6 +2232,7 @@ async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result
     let mut cmd = tokio::process::Command::new(&python_exe);
     cmd.args(["-m", "pip", "uninstall", "-y", "torch", "torchaudio"])
         .env("PYTHONUTF8", "1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
@@ -1611,6 +2266,7 @@ async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result
             "torchaudio",
         ])
         .env("PYTHONUTF8", "1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
         #[cfg(target_os = "windows")]
@@ -1652,6 +2308,7 @@ async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result
         let mut un = tokio::process::Command::new(&python_exe);
         un.args(["-m", "pip", "uninstall", "-y", "torch", "torchaudio"])
             .env("PYTHONUTF8", "1")
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(target_os = "windows")]
@@ -1667,6 +2324,7 @@ async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result
         let mut cmd3 = tokio::process::Command::new(&python_exe);
         cmd3.args(["-m", "pip", "install", "-i", pypi, "torch", "torchaudio"])
             .env("PYTHONUTF8", "1")
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(target_os = "windows")]
@@ -1747,6 +2405,16 @@ pub fn run() {
             python_setup,
             install_gpu_packages,
             save_text_file,
+            save_autosave,
+            load_autosave,
+            save_project_file,
+            open_project_file,
+            parse_subtitle_file,
+            burn_subtitles,
+            convert_traditional,
+            extract_waveform,
+            translate_text,
+            video_info,
             ollama_status,
             ollama_pull,
             ollama_installer_url,
@@ -1773,7 +2441,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::estimate_time;
+    use super::{apply_glossary, estimate_time, glossary_hotwords, parse_glossary_mapping};
 
     #[test]
     fn gpu_estimate_is_faster_than_realtime() {
@@ -1785,5 +2453,20 @@ mod tests {
     fn cpu_large_v3_estimate_is_slower_than_realtime() {
         let s = estimate_time(60.0, "large-v3".to_string(), false);
         assert!(s.contains("分钟") || s.contains("小时"), "got {s}");
+    }
+
+    #[test]
+    fn glossary_mapping_parses_pairs_and_hotwords() {
+        let g = "张三=Zhang San，李四=Li Si\n王五=Wang Wu，赵六";
+        let map = parse_glossary_mapping(g);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map[0], ("张三".to_string(), "Zhang San".to_string()));
+        assert_eq!(map[2], ("王五".to_string(), "Wang Wu".to_string()));
+        // 无 = 的整词只作为识别热词，不产生映射
+        let hw = glossary_hotwords(g);
+        assert!(hw.contains("张三") && hw.contains("赵六"));
+        assert!(!hw.contains("Zhang San"));
+        // 确定性强制替换
+        assert_eq!(apply_glossary("这是张三和李四", &map), "这是Zhang San和Li Si");
     }
 }

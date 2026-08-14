@@ -34,8 +34,14 @@ let gpuUpgrading = false;     // 是否正在升级中
 let gpuUpgradeError = "";     // 升级失败的错误信息（空 = 无错误）
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitUntil(cond, step = 200) {
-  while (!cond()) await sleep(step);
+// 轮询等待条件；timeoutMs>0 时超时返回 false，避免后端异常导致永久挂起
+async function waitUntil(cond, step = 200, timeoutMs = 0) {
+  const start = performance.now();
+  while (!cond()) {
+    if (timeoutMs > 0 && performance.now() - start > timeoutMs) return false;
+    await sleep(step);
+  }
+  return true;
 }
 
 const $ = (sel) => document.querySelector(sel);
@@ -112,7 +118,11 @@ async function boot() {
   state.modelName = localStorage.getItem("subtrans.model") || state.modelName;
   if (isSetupDone()) {
     const exists = await invoke("model_exists", { name: state.modelName }).catch(() => false);
-    if (exists) return showApp();
+    if (exists) {
+      showApp();
+      restoreAutosave();
+      return;
+    }
   }
   showWizard();
 }
@@ -248,6 +258,39 @@ function initApp() {
   $("#openBtn").addEventListener("click", openVideo);
   $("#startBtn").addEventListener("click", startProcess);
   $("#exportBtn").addEventListener("click", exportSrt);
+  $("#saveProjectBtn").addEventListener("click", saveProjectDialog);
+  $("#openProjectBtn").addEventListener("click", openProjectDialog);
+  $("#burnBtn").addEventListener("click", burnSubtitles);
+  $("#importSubBtn").addEventListener("click", () => importSubtitleFile(false));
+  $("#importSubReplaceBtn").addEventListener("click", () => importSubtitleFile(true));
+  $("#applyShiftBtn").addEventListener("click", applyShift);
+  $("#applyFpsBtn").addEventListener("click", applyFps);
+  $("#applyReplaceBtn").addEventListener("click", applyReplace);
+  $("#batchTranslateBtn").addEventListener("click", batchTranslate);
+  $("#qcBtn").addEventListener("click", checkSubtitles);
+  $("#fixOverlapBtn").addEventListener("click", fixOverlaps);
+  $("#spkA").addEventListener("click", () => assignSpeaker("甲"));
+  $("#spkB").addEventListener("click", () => assignSpeaker("乙"));
+  $("#spkC").addEventListener("click", () => assignSpeaker("丙"));
+  $("#spkD").addEventListener("click", () => assignSpeaker("丁"));
+  $("#spkClear").addEventListener("click", () => assignSpeaker(""));
+  // 烧录预设：切换时把预设参数回填到输入框（仅提示，实际由后端按预设处理）
+  $("#burnPreset").addEventListener("change", () => {
+    const p = $("#burnPreset").value;
+    if (p === "douyin") {
+      $("#burnFontSize").value = "28";
+      $("#burnMarginV").value = "160";
+      $("#burnPosition").value = "bottom";
+    } else if (p === "bilibili") {
+      $("#burnFontSize").value = "20";
+      $("#burnMarginV").value = "32";
+      $("#burnPosition").value = "bottom";
+    } else if (p === "youtube") {
+      $("#burnFontSize").value = "18";
+      $("#burnMarginV").value = "36";
+      $("#burnPosition").value = "bottom";
+    }
+  });
   $("#testOllama").addEventListener("click", testOllama);
   $("#pyInstallBtn").addEventListener("click", installPython);
   $("#gpuPackagesBtn").addEventListener("click", installGpuPackages);
@@ -337,6 +380,137 @@ function initApp() {
       pump();
     }
   });
+
+  // ── 校对快捷键 + 循环播放（字幕工作站 ①） ──
+  const isTyping = () => {
+    const el = document.activeElement;
+    return (
+      el &&
+      (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)
+    );
+  };
+  let lastL = 0;
+  document.addEventListener("keydown", (e) => {
+    // Ctrl+Z/Y 撤销重做（输入框内交给原生撤销，不抢占）
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === "z" && !isTyping()) {
+        e.preventDefault();
+        undo();
+      } else if (k === "y" && !isTyping()) {
+        e.preventDefault();
+        redo();
+      }
+      return;
+    }
+    if (isTyping() || e.ctrlKey || e.metaKey || e.altKey) return;
+    const v = $("#video");
+    if (!v || !v.duration) return;
+    switch (e.key) {
+      case " ": {
+        // 焦点在按钮上时，空格会二次触发按钮 click，直接放行不拦截
+        const ae = document.activeElement;
+        if (ae && ae.tagName === "BUTTON") return;
+        e.preventDefault();
+        if (v.paused) v.play().catch(() => {});
+        else v.pause();
+        break;
+      }
+      case "1":
+        assignSpeaker("甲");
+        break;
+      case "2":
+        assignSpeaker("乙");
+        break;
+      case "3":
+        assignSpeaker("丙");
+        break;
+      case "4":
+        assignSpeaker("丁");
+        break;
+      case "0":
+        assignSpeaker("");
+        break;
+      case "ArrowLeft":
+        v.currentTime = Math.max(0, v.currentTime - (e.shiftKey ? 0.1 : 1));
+        break;
+      case "ArrowRight":
+        v.currentTime = Math.min(v.duration, v.currentTime + (e.shiftKey ? 0.1 : 1));
+        break;
+      case "ArrowUp":
+      case "ArrowDown": {
+        e.preventDefault();
+        const i = currentSubIndex();
+        const next = e.key === "ArrowDown" ? i + 1 : Math.max(0, i - 1);
+        if (state.subtitles[next]) {
+          v.currentTime = state.subtitles[next].start;
+          v.pause();
+        }
+        break;
+      }
+      case "j":
+      case "J":
+        v.currentTime = Math.max(0, v.currentTime - 10);
+        v.playbackRate = 1;
+        lastL = 0;
+        break;
+      case "k":
+      case "K":
+        v.pause();
+        break;
+      case "l":
+      case "L": {
+        const now = performance.now();
+        lastL = now - lastL < 500 ? lastL + 1 : 1;
+        if (lastL >= 3) v.playbackRate = 2;
+        else if (lastL === 2) v.playbackRate = 1.5;
+        else v.currentTime = Math.min(v.duration, v.currentTime + 10);
+        break;
+      }
+      case "e":
+      case "E": {
+        const i = currentSubIndex();
+        if (i >= 0) {
+          $("#subsDrawer").classList.remove("hidden");
+          startEdit(i, "original");
+        }
+        break;
+      }
+      case "Delete": {
+        const i = currentSubIndex();
+        if (i >= 0) deleteSubtitle(i);
+        break;
+      }
+      case "r":
+      case "R":
+        toggleLoopCurrent();
+        break;
+      default:
+        break;
+    }
+  });
+
+  // 循环播放：到循环终点跳回起点
+  video.addEventListener("timeupdate", () => {
+    if (video.dataset.loopEnd && video.currentTime >= Number(video.dataset.loopEnd)) {
+      video.currentTime = Number(video.dataset.loopStart) || 0;
+    }
+  });
+
+  // 波形图：播放跟随 + 点击拖动定位
+  video.addEventListener("timeupdate", () => scheduleWaveformDraw());
+  const wfWrap = $("#waveformWrap");
+  wfWrap.addEventListener("mousedown", (e) => {
+    wfDrag = true;
+    seekWaveform(e);
+  });
+  wfWrap.addEventListener("mousemove", (e) => {
+    if (wfDrag) seekWaveform(e);
+  });
+  document.addEventListener("mouseup", () => {
+    wfDrag = false;
+  });
+  window.addEventListener("resize", () => scheduleWaveformDraw());
 }
 
 async function openVideo() {
@@ -344,12 +518,19 @@ async function openVideo() {
     filters: [{ name: "视频", extensions: ["mp4", "mkv", "avi", "mov", "webm", "flv", "m4v"] }],
   });
   if (!path) return;
+  // 先落盘当前会话草稿，再切换：避免 30s 周期/关闭时用"新视频+空字幕"覆盖旧草稿
+  await saveAutosave();
   // 切换视频前停掉旧流水线，避免旧任务继续往新列表里塞字幕
   stream.running = false;
   stream.done = true;
   stream.processing = false;
   stream.pumping = false;
+  stream.waiting = false;
+  stream.total = 0;
+  stream.readyUntil = 0;
+  stream.failedChunks = [];
   stream.audioSource = null; // 旧视频的人声轨不能留给新视频
+  resetUndo(); // 旧会话字幕快照不得跨视频生效
   state.videoPath = path;
   state.subtitles = [];
   renderSubList();
@@ -358,8 +539,18 @@ async function openVideo() {
   $("#stageEmpty").classList.add("hidden");
   $("#startBtn").disabled = false;
   $("#exportBtn").disabled = true;
-  // 视频加载后更新预估时间
-  $("#video").addEventListener("loadedmetadata", () => updateEstimate(), { once: true });
+  // 视频加载后更新预估时间 + 提取波形 + 读取视频信息
+  wf = null;
+  $("#waveformWrap").classList.add("hidden");
+  $("#video").addEventListener(
+    "loadedmetadata",
+    () => {
+      updateEstimate();
+      loadWaveform();
+      loadVideoInfo();
+    },
+    { once: true }
+  );
   // 步骤 1 完成 → 自动进入步骤 2
   setStepDone(1);
   goStep(2);
@@ -404,12 +595,13 @@ async function invokeChunk(start, dur) {
     glossary: $("#glossary").value || "",
     useFw: $("#useFw").checked,
     vadEnabled: $("#vadFilter").checked,
+    denoiseFilter: $("#denoiseFilter")?.value || "none",
     // 优先用探测/用户填写的 Python（否则检测是绿的、实际运行却找不到解释器）；
     // 留空时后端才回退 bundled Python。
     fwPython: $("#pyPython").value.trim(),
     fwDevice: $("#fwDevice").value,
   });
-  if (state.videoPath === videoAtCall) res.segments.forEach(addSubtitle);
+  if (state.videoPath === videoAtCall) appendSubtitles(res.segments);
   return res;
 }
 
@@ -427,9 +619,9 @@ async function processNextChunk() {
   const videoAtStart = state.videoPath; // 处理期间可能切换视频，返回后丢弃旧结果
   try {
     const res = await invokeChunk(start, dur);
+    if (state.videoPath !== videoAtStart) return null; // 已切视频：不回写任何流水线状态
     // 处理期间用户可能向前 seek 改大了 readyUntil，不能被旧分片覆盖
     stream.readyUntil = Math.max(stream.readyUntil, start + dur);
-    if (state.videoPath !== videoAtStart) return null; // 已切视频，丢弃本次结果
     updateStatus(res);
     if (stream.waiting) {
       // 之前因等字幕暂停了，现在新片就绪 → 继续播放
@@ -439,6 +631,7 @@ async function processNextChunk() {
     return performance.now() - t0;
   } catch (err) {
     console.error("[subtrans] process_chunk failed:", start, dur, err);
+    if (state.videoPath !== videoAtStart) return null; // 已切视频：错误属于旧会话，不回写
     // 跳过出错分片，继续处理后续分片（而非停止整个流水线）
     stream.readyUntil = Math.max(stream.readyUntil, start + dur); // 跳过这一段
     if (!stream.failedChunks) stream.failedChunks = [];
@@ -458,6 +651,7 @@ async function processNextChunk() {
 async function pump() {
   if (stream.pumping) return;
   stream.pumping = true;
+  const videoAtPump = state.videoPath; // 归属会话：切换视频后本 pump 静默退出
   while (stream.running && !stream.done) {
     const ms = await processNextChunk();
     if (ms === null) {
@@ -466,7 +660,8 @@ async function pump() {
     }
   }
   stream.pumping = false;
-  if (stream.done) {
+  // openVideo 会把 running 置 false：收尾块只对"真正跑完"的会话生效
+  if (stream.done && stream.running && state.videoPath === videoAtPump) {
     const failed = stream.failedChunks || [];
     const failMsg = failed.length ? `（${failed.length} 个分片出错已跳过：${failed.map(f => fmt(f.start)).join(", ")}）` : "";
     $("#runMsg").textContent = `字幕已全部生成（至 ${fmt(stream.total)}）${failMsg}`;
@@ -513,10 +708,12 @@ async function startProcess() {
   }
   state.subtitles = [];
   renderSubList();
+  resetUndo(); // 新一轮识别：旧字幕/旧撤销历史全部作废
   $("#startBtn").disabled = true;
   $("#exportBtn").disabled = true;
   setFill("#runFill", 0);
 
+  const videoAtProc = state.videoPath; // 会话令牌：中途切视频则本次启动静默放弃
   Object.assign(stream, {
     chunkLen: 120,
     readyUntil: 0,
@@ -555,6 +752,7 @@ async function startProcess() {
   // 先处理头一片，再开播 + 启动后台连续流水线
   $("#runMsg").textContent = `处理第一段（约${Math.round(stream.chunkLen / 60)}分钟）...`;
   const ms = await processNextChunk();
+  if (state.videoPath !== videoAtProc) return; // 处理期间已切换视频：不播放、不起流水线
   if (ms !== null && ms > stream.chunkLen * 1000) {
     // 处理耗时超过分片时长（慢于实时）→ 后续改更小分片
     stream.smallSlices = true;
@@ -567,41 +765,370 @@ async function startProcess() {
   pump(); // 不 await，后台持续处理
 }
 
-// ───────── 字幕渲染 ─────────
-function addSubtitle(sub) {
-  // 按 start 时间有序插入（补洞/seek 可能乱序到达），保证 overlay 二分查找正确
-  const arr = state.subtitles;
-  let lo = 0, hi = arr.length;
+// ───────── 字幕渲染 + 编辑（字幕工作站 ①/⑤） ─────────
+
+// 项目是否被修改（供自动保存/项目保存使用）
+let projectDirty = false;
+let autosaveTimer = null;
+function markDirty() {
+  projectDirty = true;
+  if (autosaveTimer) return;
+  autosaveTimer = setTimeout(() => {
+    autosaveTimer = null;
+    projectDirty = false;
+    saveAutosave();
+  }, 3000);
+}
+
+function fmtTimeInput(sec) {
+  // 用总厘秒数整体计算并进位（避免 "SS.100" / "SS.10" 之类非法时间码），
+  // 厘秒精度保证打开编辑器→直接回车不会明显改动时间码（最大漂移 5ms）
+  const totalCs = Math.round(sec * 100);
+  const m = Math.floor(totalCs / 6000);
+  const s = Math.floor((totalCs % 6000) / 100);
+  const c = totalCs % 100;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(c).padStart(2, "0")}`;
+}
+
+function parseTimeInput(str) {
+  const m = String(str).trim().match(/^(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?$/);
+  if (!m) return null;
+  const frac = m[3] ? Number(`0.${m[3]}`) : 0;
+  return Number(m[1]) * 60 + Number(m[2]) + frac;
+}
+
+function findSubIndexAt(t) {
+  const subs = state.subtitles;
+  let lo = 0, hi = subs.length;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (arr[mid].start < sub.start) lo = mid + 1;
+    if (subs[mid].start <= t) lo = mid + 1;
     else hi = mid;
   }
-  arr.splice(lo, 0, sub);
-  // 切到字幕 tab 不强制，但追加渲染
-  const list = $("#subList");
-  $(".empty")?.remove();
+  for (let i = lo - 1; i >= 0 && i >= lo - 50; i--) {
+    if (subs[i].end >= t) return i;
+  }
+  return -1;
+}
+
+function currentSubIndex() {
+  return findSubIndexAt($("#video").currentTime);
+}
+
+function rowFor(idx) {
+  return document.querySelector(`.sub-row[data-idx="${idx}"]`);
+}
+
+function buildRow(sub, idx) {
   const row = document.createElement("div");
   row.className = "sub-row";
-  row.dataset.start = sub.start;
+  row.dataset.idx = String(idx);
   row.innerHTML = `
-    <div class="sub-time">${fmt(sub.start)}</div>
+    <div class="sub-time" title="点击编辑时间">${fmt(sub.start)}</div>
     <div class="sub-text">
-      <div class="sub-orig">${escapeHtml(sub.original)}</div>
+      ${sub.speaker ? `<span class="speaker-badge">${escapeHtml(sub.speaker)}</span>` : ""}
+      <div class="sub-orig ${sub.original ? "" : "dim"}">${sub.original ? escapeHtml(sub.original) : "（空）"}</div>
       ${sub.translated ? `<div class="sub-trans">${escapeHtml(sub.translated)}</div>` : ""}
+    </div>
+    <div class="sub-actions">
+      <button class="mini-btn" data-act="retr" title="用当前引擎重新翻译本条">🔄</button>
+      <button class="mini-btn" data-act="merge" title="与下一条合并">⤵</button>
+      <button class="mini-btn" data-act="split" title="按时间中点拆分为两条">⤴</button>
+      <button class="mini-btn danger" data-act="del" title="删除本条">✕</button>
     </div>`;
-  row.addEventListener("click", () => {
+  row.addEventListener("click", (e) => {
+    if (e.target.closest(".sub-actions") || e.target.closest(".sub-edit") || e.target.closest(".time-edit")) return;
     $("#video").currentTime = sub.start;
   });
-  // 按 start 位置插入 DOM 行，保持列表与 state.subtitles 同序
-  // （补洞/seek 乱序到达时不会出现“时间排序正确但列表乱序”）
-  const next = list.children[lo];
-  if (next) list.insertBefore(row, next);
-  else list.appendChild(row);
-  // 只有本来就接近底部时才自动滚动，避免打断用户向上翻看
-  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
-  if (nearBottom) list.scrollTop = list.scrollHeight;
-  $("#subCount").textContent = `· ${state.subtitles.length} 条`;
+  row.addEventListener("dblclick", (e) => {
+    if (e.target.classList.contains("sub-orig")) startEdit(idx, "original");
+    else if (e.target.classList.contains("sub-trans")) startEdit(idx, "translated");
+  });
+  row.querySelector(".sub-time").addEventListener("click", (e) => {
+    e.stopPropagation();
+    startTimeEdit(idx);
+  });
+  row.querySelector('[data-act="merge"]').addEventListener("click", (e) => {
+    e.stopPropagation();
+    mergeWithNext(idx);
+  });
+  row.querySelector('[data-act="split"]').addEventListener("click", (e) => {
+    e.stopPropagation();
+    splitSubtitle(idx);
+  });
+  row.querySelector('[data-act="del"]').addEventListener("click", (e) => {
+    e.stopPropagation();
+    deleteSubtitle(idx);
+  });
+  row.querySelector('[data-act="retr"]').addEventListener("click", (e) => {
+    e.stopPropagation();
+    retranslateOne(idx);
+  });
+  return row;
+}
+
+// 批量追加（识别分片返回）：按 start 有序插入后整体重建，保证 data-idx 与数组下标一致。
+// 每个批次推入撤销栈：Ctrl+Z 可整体撤掉最近一批（避免追加与手动编辑的快照脱节）。
+function appendSubtitles(segs, opts = {}) {
+  if (!segs.length) return;
+  if (!opts.noUndo) pushUndo();
+  for (const s of segs) {
+    let lo = 0, hi = state.subtitles.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (state.subtitles[mid].start < s.start) lo = mid + 1;
+      else hi = mid;
+    }
+    state.subtitles.splice(lo, 0, s);
+  }
+  markDirty();
+  refreshSubList(true);
+}
+
+function refreshSubList(autoScroll) {
+  const list = $("#subList");
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
+  list.innerHTML = "";
+  if (!state.subtitles.length) {
+    list.innerHTML = '<div class="empty">识别后字幕会显示在这里</div>';
+  } else {
+    state.subtitles.forEach((sub, i) => list.appendChild(buildRow(sub, i)));
+  }
+  $("#subCount").textContent = state.subtitles.length ? `· ${state.subtitles.length} 条` : "";
+  if (autoScroll && nearBottom) list.scrollTop = list.scrollHeight;
+  scheduleWaveformDraw();
+}
+
+// ── 撤销 / 重做（快照式：字幕数组 JSON，上限 50 步） ──
+const undoStack = [];
+const redoStack = [];
+// 每个识别分片批次也是一步撤销，长视频分片多，上限放宽防手动编辑历史被挤出
+const UNDO_MAX = 100;
+let lastSnapshot = null;
+
+function snapshotSubs() {
+  return JSON.stringify(state.subtitles);
+}
+
+function pushUndo() {
+  const snap = snapshotSubs();
+  if (snap === lastSnapshot) return; // 同一状态不重复入栈
+  lastSnapshot = snap;
+  undoStack.push(snap);
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+  redoStack.length = 0;
+}
+
+function restoreSnapshot(snap) {
+  try {
+    state.subtitles = JSON.parse(snap);
+  } catch {
+    return;
+  }
+  markDirty();
+  refreshSubList();
+}
+
+function undo() {
+  if (!undoStack.length) return;
+  redoStack.push(snapshotSubs());
+  const prev = undoStack.pop();
+  lastSnapshot = prev;
+  restoreSnapshot(prev);
+  $("#runMsg").textContent = "已撤销";
+}
+
+function redo() {
+  if (!redoStack.length) return;
+  undoStack.push(snapshotSubs());
+  const next = redoStack.pop();
+  lastSnapshot = next;
+  restoreSnapshot(next);
+  $("#runMsg").textContent = "已重做";
+}
+
+// 会话切换（新视频/重新识别/打开项目）时必须清空：否则旧会话的字幕快照会经 Ctrl+Z 灌进新会话
+function resetUndo() {
+  undoStack.length = 0;
+  redoStack.length = 0;
+  lastSnapshot = null;
+}
+
+// ── 行内编辑 ──
+let editState = null;
+
+function commitInlineEdit() {
+  if (!editState) return;
+  const { sub, field, textarea } = editState;
+  editState = null;
+  const text = textarea.value.trim();
+  const div = document.createElement("div");
+  div.className = field === "original" ? "sub-orig" : "sub-trans";
+  div.textContent = text || "（空）";
+  // 行可能因列表重建已脱离 DOM（编辑中途来了新分片）：直接提交到对象并整表刷新
+  const detached = !textarea.isConnected;
+  textarea.replaceWith(div);
+  if (sub && (sub[field] || "") !== text) {
+    pushUndo();
+    sub[field] = text;
+    markDirty();
+  }
+  if (detached) refreshSubList();
+}
+
+function startEdit(idx, field) {
+  commitInlineEdit();
+  const row = rowFor(idx);
+  const el = row?.querySelector(field === "original" ? ".sub-orig" : ".sub-trans");
+  // 捕获对象引用而非索引：编辑期间列表可能因新分片插入而重排，
+  // 索引会移位导致提交写进错误的条目
+  const sub = state.subtitles[idx];
+  if (!el || !sub) return;
+  const ta = document.createElement("textarea");
+  ta.className = "sub-edit";
+  ta.value = sub[field] || "";
+  el.replaceWith(ta);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  editState = { sub, field, textarea: ta };
+  ta.addEventListener("blur", () => commitInlineEdit());
+  ta.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      ta.blur();
+    } else if (e.key === "Escape") {
+      ta.value = sub[field] || "";
+      ta.blur();
+    }
+  });
+}
+
+function startTimeEdit(idx) {
+  commitInlineEdit();
+  const row = rowFor(idx);
+  const timeEl = row?.querySelector(".sub-time");
+  const s = state.subtitles[idx];
+  if (!timeEl || !s) return;
+  const wrap = document.createElement("span");
+  wrap.className = "time-edit";
+  wrap.innerHTML =
+    `<input class="time-input" value="${fmtTimeInput(s.start)}">` +
+    `<span class="time-sep">→</span>` +
+    `<input class="time-input" value="${fmtTimeInput(s.end)}">`;
+  timeEl.replaceWith(wrap);
+  const [inA, inB] = wrap.querySelectorAll("input");
+  inA.focus();
+  inA.select();
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    const ns = parseTimeInput(inA.value);
+    const ne = parseTimeInput(inB.value);
+    // 仅在值实际变化时提交，避免"打开→回车"无谓入撤销栈
+    const changed =
+      ns != null && ne != null && ne > ns &&
+      (Math.abs(ns - s.start) > 1e-6 || Math.abs(ne - s.end) > 1e-6);
+    if (changed) {
+      pushUndo();
+      // 直接改捕获的对象引用，列表重排不影响正确性
+      s.start = ns;
+      s.end = ne;
+      state.subtitles.sort((a, b) => a.start - b.start);
+      markDirty();
+    }
+    refreshSubList();
+  };
+  // 两框互切不提交（焦点仍在 wrap 内）；点击外部/回车/Esc 才提交
+  inA.addEventListener("blur", () => {
+    if (!wrap.contains(document.activeElement)) finish();
+  });
+  inB.addEventListener("blur", () => {
+    if (!wrap.contains(document.activeElement)) finish();
+  });
+  wrap.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish();
+    } else if (e.key === "Escape") {
+      done = true;
+      refreshSubList();
+    }
+  });
+}
+
+// ── 条目操作 ──
+function deleteSubtitle(idx) {
+  commitInlineEdit();
+  if (!state.subtitles[idx]) return;
+  pushUndo();
+  state.subtitles.splice(idx, 1);
+  markDirty();
+  refreshSubList();
+}
+
+function mergeWithNext(idx) {
+  commitInlineEdit();
+  const a = state.subtitles[idx];
+  const b = state.subtitles[idx + 1];
+  if (!a || !b) return;
+  pushUndo();
+  // 用 max 防后一条完全包在前一条内时时长回缩
+  a.end = Math.max(a.end, b.end);
+  a.original = [a.original, b.original].filter(Boolean).join("\n");
+  a.translated = [a.translated, b.translated].filter(Boolean).join("\n");
+  state.subtitles.splice(idx + 1, 1);
+  markDirty();
+  refreshSubList();
+}
+
+function splitSubtitle(idx) {
+  commitInlineEdit();
+  const s = state.subtitles[idx];
+  if (!s || s.end - s.start < 0.4) return;
+  pushUndo();
+  const mid = (s.start + s.end) / 2;
+  // 按码点切分：直接按 UTF-16 长度切会截断 emoji 等代理对
+  const orig = Array.from(s.original);
+  const trans = Array.from(s.translated || "");
+  const halfO = Math.floor(orig.length / 2);
+  const halfT = Math.floor(trans.length / 2);
+  const a = {
+    ...s,
+    end: mid,
+    original: orig.slice(0, halfO).join("").trim(),
+    translated: trans.slice(0, halfT).join("").trim(),
+  };
+  const b = {
+    ...s,
+    start: mid,
+    original: orig.slice(halfO).join("").trim(),
+    translated: trans.slice(halfT).join("").trim(),
+  };
+  state.subtitles.splice(idx, 1, a, b);
+  markDirty();
+  refreshSubList();
+}
+
+// ── 循环播放当前字幕 ──
+function toggleLoopCurrent() {
+  const v = $("#video");
+  const i = currentSubIndex();
+  if (i < 0) return;
+  const s = state.subtitles[i];
+  if (v.dataset.loopIdx === String(i)) {
+    delete v.dataset.loopIdx;
+    delete v.dataset.loopStart;
+    delete v.dataset.loopEnd;
+    $("#runMsg").textContent = "循环播放已关闭";
+  } else {
+    v.dataset.loopIdx = String(i);
+    v.dataset.loopStart = String(Math.max(0, s.start - 0.2));
+    v.dataset.loopEnd = String(s.end + 0.3);
+    $("#runMsg").textContent = "循环播放本条字幕（按 R 关闭）";
+  }
 }
 
 function renderSubList() {
@@ -613,21 +1140,19 @@ function renderSubList() {
 }
 
 function updateOverlay(t) {
-  // 字幕按 start 排序：先二分找 start <= t 的最右一条，再向前小范围扫描，
-  // 兼容补洞/seek 可能产生的重叠字幕，避免显示到“碰巧命中”的旧字幕。
   const subs = state.subtitles;
-  let cur = null;
-  let lo = 0, hi = subs.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (subs[mid].start <= t) lo = mid + 1;
-    else hi = mid;
-  }
-  for (let i = lo - 1; i >= 0 && i >= lo - 50; i--) {
-    const s = subs[i];
-    if (s.end >= t) {
-      cur = s;
-      break;
+  const idx = findSubIndexAt(t);
+  const cur = idx >= 0 ? subs[idx] : null;
+  // 抽屉跟随：高亮当前字幕；用户上翻时不强制滚动，只做最近边缘对齐
+  document.querySelectorAll(".sub-row.active").forEach((r) => r.classList.remove("active"));
+  if (idx >= 0) {
+    const row = rowFor(idx);
+    if (row) {
+      row.classList.add("active");
+      const body = document.querySelector(".drawer-body");
+      if (body && body.scrollHeight - body.scrollTop - body.clientHeight < 80) {
+        row.scrollIntoView({ block: "nearest" });
+      }
     }
   }
   const overlay = $("#overlay");
@@ -643,20 +1168,301 @@ function updateOverlay(t) {
   } else overlay.classList.add("hidden");
 }
 
+// ───────── 音频波形图（字幕工作站 ⑤） ─────────
+let wf = null; // Float32Array（100Hz 单声道样本）
+let wfRate = 100;
+let wfLastDraw = 0;
+let wfDrag = false;
+
+function scheduleWaveformDraw() {
+  if (!wf) return;
+  const now = performance.now();
+  if (now - wfLastDraw < 150) return; // 最多 ~7fps，播放头足够流畅且省 CPU
+  wfLastDraw = now;
+  requestAnimationFrame(drawWaveform);
+}
+
+async function loadWaveform() {
+  const vp = state.videoPath;
+  if (!vp) return;
+  try {
+    const d = await invoke("extract_waveform", { videoPath: vp });
+    if (state.videoPath !== vp) return; // 等待期间已切换视频：丢弃旧结果
+    const bin = atob(d.samples_b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    wf = new Float32Array(bytes.buffer, 0, Math.floor(bin.length / 4));
+    wfRate = d.sample_rate || 100;
+    $("#waveformWrap").classList.remove("hidden");
+    drawWaveform();
+  } catch (e) {
+    console.error("[subtrans] load waveform failed:", e);
+    wf = null;
+  }
+}
+
+function drawWaveform() {
+  const wrap = $("#waveformWrap");
+  const cv = $("#waveform");
+  if (!wf || wrap.classList.contains("hidden")) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = wrap.clientWidth;
+  const h = wrap.clientHeight;
+  if (!w || !h) return;
+  if (cv.width !== Math.floor(w * dpr) || cv.height !== Math.floor(h * dpr)) {
+    cv.width = Math.floor(w * dpr);
+    cv.height = Math.floor(h * dpr);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const dur = $("#video").duration || wf.length / wfRate;
+  const n = wf.length;
+  // 每像素取峰值画对称波形
+  for (let x = 0; x < w; x++) {
+    const i0 = Math.floor((x * n) / w);
+    const i1 = Math.max(i0 + 1, Math.floor(((x + 1) * n) / w));
+    let amp = 0;
+    for (let i = i0; i < i1; i++) {
+      const v = wf[i] < 0 ? -wf[i] : wf[i];
+      if (v > amp) amp = v;
+    }
+    const bh = Math.max(1, Math.min(h / 2 - 3, amp * (h / 2 - 3)));
+    ctx.fillStyle = "rgba(233,237,243,0.25)";
+    ctx.fillRect(x, h / 2 - bh, 1, bh * 2);
+  }
+  // 已有字幕覆盖区（金色底）
+  if (dur > 0 && state.subtitles.length) {
+    ctx.fillStyle = "rgba(232,184,75,0.4)";
+    for (const s of state.subtitles) {
+      const x0 = (s.start / dur) * w;
+      const x1 = Math.max(x0 + 1, (s.end / dur) * w);
+      ctx.fillRect(x0, 3, x1 - x0, h - 6);
+    }
+  }
+  // 播放头
+  if (dur > 0) {
+    const t = $("#video").currentTime || 0;
+    const px = Math.min(w, Math.max(0, (t / dur) * w));
+    ctx.fillStyle = "#f2c460";
+    ctx.fillRect(px - 1, 0, 2, h);
+  }
+}
+
+function seekWaveform(e) {
+  const wrap = $("#waveformWrap");
+  const dur = $("#video").duration;
+  if (!dur) return;
+  const rect = wrap.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / Math.max(1, rect.width);
+  $("#video").currentTime = Math.max(0, Math.min(dur, frac * dur));
+  drawWaveform();
+}
+
+// ───────── 项目保存 / 自动保存（字幕工作站 ②） ─────────
+
+// includeSecret=true 时保存 API Key（仅用户显式保存的项目文件）；
+// 自动保存草稿不落盘密钥，避免明文泄露
+function collectProject(includeSecret = false) {
+  return {
+    version: 1,
+    videoPath: state.videoPath,
+    totalSec: stream.total || $("#video").duration || 0,
+    subtitles: state.subtitles,
+    settings: {
+      modelName: $("#whisperModel").value,
+      sourceLang: $("#sourceLang").value,
+      targetLang: $("#targetLang").value,
+      engine: $("#engine").value,
+      dsKey: includeSecret ? $("#dsKey").value : "",
+      dsModel: $("#dsModel").value,
+      olHost: $("#olHost").value,
+      olModel: $("#olModel").value,
+      transEnabled: $("#transEnabled").checked,
+      correctEnabled: $("#correctEnabled").checked,
+      glossary: $("#glossary").value,
+      useFw: $("#useFw").checked,
+      vadEnabled: $("#vadFilter").checked,
+      hiQuality: $("#hiQuality").checked,
+      denoiseFilter: $("#denoiseFilter").value,
+      fwDevice: $("#fwDevice").value,
+      demucsDevice: $("#demucsDevice").value,
+      demucsModel: $("#demucsModel").value,
+      pyPython: $("#pyPython").value,
+      showOrig: $("#showOrig").checked,
+      showTrans: $("#showTrans").checked,
+    },
+  };
+}
+
+function applyProject(p) {
+  if (!p || typeof p !== "object") return false;
+  // 字幕（对损坏字段做兜底，不让一个坏条目毁掉整个项目）
+  if (Array.isArray(p.subtitles)) {
+    state.subtitles = p.subtitles
+      .filter((s) => s && Number.isFinite(+s.start) && Number.isFinite(+s.end))
+      .map((s) => ({
+        index: 0,
+        start: Math.max(0, +s.start),
+        end: Math.max(+s.start, +s.end),
+        original: String(s.original ?? ""),
+        translated: String(s.translated ?? ""),
+        speaker: String(s.speaker ?? ""),
+      }))
+      .sort((a, b) => a.start - b.start);
+    refreshSubList();
+  }
+  const s = p.settings || {};
+  const setVal = (sel, v) => {
+    const el = $(sel);
+    if (el && v != null) el.value = v;
+  };
+  const setChk = (sel, v) => {
+    const el = $(sel);
+    if (el && v != null) el.checked = !!v;
+  };
+  setVal("#whisperModel", s.modelName);
+  setVal("#sourceLang", s.sourceLang);
+  setVal("#targetLang", s.targetLang);
+  setVal("#engine", s.engine);
+  setVal("#dsKey", s.dsKey);
+  setVal("#dsModel", s.dsModel);
+  setVal("#olHost", s.olHost);
+  setVal("#olModel", s.olModel);
+  setVal("#glossary", s.glossary);
+  setVal("#denoiseFilter", s.denoiseFilter);
+  setVal("#fwDevice", s.fwDevice);
+  setVal("#demucsDevice", s.demucsDevice);
+  setVal("#demucsModel", s.demucsModel);
+  setVal("#pyPython", s.pyPython);
+  setChk("#transEnabled", s.transEnabled);
+  setChk("#correctEnabled", s.correctEnabled);
+  setChk("#useFw", s.useFw);
+  setChk("#vadEnabled", s.vadEnabled);
+  setChk("#hiQuality", s.hiQuality);
+  setChk("#showOrig", s.showOrig);
+  setChk("#showTrans", s.showTrans);
+  // 视频
+  if (p.videoPath) {
+    state.videoPath = p.videoPath;
+    $("#fileName").textContent = p.videoPath.split(/[\\/]/).pop();
+    $("#video").src = convertFileSrc(p.videoPath);
+    $("#stageEmpty").classList.add("hidden");
+    $("#startBtn").disabled = false;
+    // 与 openVideo 一致：元数据就绪后加载波形/视频信息/预估
+    wf = null;
+    $("#waveformWrap").classList.add("hidden");
+    $("#video").addEventListener(
+      "loadedmetadata",
+      () => {
+        updateEstimate();
+        loadWaveform();
+        loadVideoInfo();
+      },
+      { once: true }
+    );
+  }
+  if (Number.isFinite(+p.totalSec) && +p.totalSec > 0) {
+    stream.total = +p.totalSec;
+    stream.readyUntil = +p.totalSec; // 视为已处理到末尾；导出时缺口会自动补全
+    stream.done = true;
+  }
+  setStepDone(1);
+  if (state.subtitles.length) setStepDone(2);
+  updateEngineHint();
+  updateCorrectHint();
+  updateEstimate();
+  return true;
+}
+
+async function saveAutosave() {
+  try {
+    const p = collectProject();
+    // 空会话（无视频且无字幕）不写草稿，避免覆盖更早的有效草稿
+    if (!p.videoPath && !p.subtitles.length) return;
+    await invoke("save_autosave", { json: JSON.stringify(p) });
+  } catch (e) {
+    console.error("[subtrans] autosave failed:", e);
+  }
+}
+
+async function restoreAutosave() {
+  try {
+    const p = await invoke("load_autosave");
+    if (p && applyProject(p)) {
+      $("#runMsg").textContent = `已恢复上次会话（${state.subtitles.length} 条字幕）${
+        state.videoPath ? "" : "· 原视频已移动，字幕仍保留"
+      }`;
+    }
+  } catch (e) {
+    console.error("[subtrans] restore autosave failed:", e);
+  }
+}
+
+async function saveProjectDialog() {
+  const path = await saveDialog({
+    defaultPath: "subtrans-project.subtrans",
+    filters: [{ name: "SubTrans 项目", extensions: ["subtrans", "json"] }],
+  });
+  if (!path) return;
+  try {
+    await invoke("save_project_file", { path, json: JSON.stringify(collectProject(true)) });
+    $("#runMsg").textContent = `项目已保存: ${path}`;
+  } catch (err) {
+    $("#runMsg").textContent = `保存项目失败: ${err}`;
+  }
+}
+
+async function openProjectDialog() {
+  const path = await openDialog({
+    filters: [{ name: "SubTrans 项目", extensions: ["subtrans", "json"] }],
+  });
+  if (!path) return;
+  try {
+    const p = await invoke("open_project_file", { path });
+    // 打开项目前停掉旧流水线，避免旧任务往新字幕里塞数据
+    stream.running = false;
+    stream.done = true;
+    stream.processing = false;
+    stream.pumping = false;
+    stream.audioSource = null;
+    state.videoPath = "";
+    state.subtitles = [];
+    resetUndo(); // 打开的项目是全新会话，旧撤销历史不得混入
+    if (applyProject(p)) {
+      lastSnapshot = snapshotSubs(); // 以载入状态为撤销基准
+      goStep(3);
+      $("#runMsg").textContent = `项目已打开（${state.subtitles.length} 条字幕）`;
+    }
+  } catch (err) {
+    $("#runMsg").textContent = `打开项目失败: ${err}`;
+  }
+}
+
 // ───────── 导出 SRT ─────────
 async function exportSrt() {
   if (!state.videoPath) return;
   const total = $("#video").duration || stream.total;
   $("#exportBtn").disabled = true;
 
-  // 1) 后台流水线还在跑则等它真正结束（含分片间短暂休眠的间隙），避免补洞与流水线并发
+  // 1) 后台流水线还在跑则等它真正结束（含分片间短暂休眠的间隙），避免补洞与流水线并发。
+  //    1 小时兜底超时：后端异常时不至于永远卡在"等待字幕生成完成"
+  const WAIT_TIMEOUT = 60 * 60 * 1000;
   if (stream.running && !stream.done) {
     $("#runMsg").textContent = "等待后台字幕生成完成...";
-    await waitUntil(() => stream.done);
+    if (!(await waitUntil(() => stream.done, 200, WAIT_TIMEOUT))) {
+      $("#exportBtn").disabled = false;
+      $("#runMsg").textContent = "等待字幕生成超时，请先停止/重试识别";
+      return;
+    }
   }
   if (stream.pumping || stream.processing) {
     $("#runMsg").textContent = "等待后台字幕生成完成...";
-    await waitUntil(() => !stream.pumping && !stream.processing);
+    if (!(await waitUntil(() => !stream.pumping && !stream.processing, 200, WAIT_TIMEOUT))) {
+      $("#exportBtn").disabled = false;
+      $("#runMsg").textContent = "等待字幕生成超时，请先停止/重试识别";
+      return;
+    }
   }
   // 2) 补全所有未覆盖的时间段（含因跳转产生的空洞）后再导出
   if (total) {
@@ -692,28 +1498,481 @@ async function exportSrt() {
     merged.push({ ...s });
   }
   const subs = merged;
-  const path = await saveDialog({ defaultPath: "subtitle.srt", filters: [{ name: "SRT", extensions: ["srt"] }] });
+  const format = $("#exportFormat").value || "srt";
+  const path = await saveDialog({
+    defaultPath: `subtitle.${format}`,
+    filters: [{ name: format.toUpperCase(), extensions: [format] }],
+  });
   if (!path) {
     $("#exportBtn").disabled = false;
     return;
   }
   const showOrig = $("#showOrig").checked;
+  let content;
+  if (format === "vtt") content = buildVttContent(subs, showOrig);
+  else if (format === "ass") content = buildAssContent(subs, showOrig);
+  else content = buildSrtContent(subs, showOrig);
+  // 可选：繁体输出（OpenCC 简体→繁体）
+  if ($("#tradOutput").checked) {
+    try {
+      content = await invoke("convert_traditional", { text: content });
+    } catch (err) {
+      $("#runMsg").textContent = `繁体转换失败（已按简体导出）: ${err}`;
+    }
+  }
+  await invoke("save_text_file", { path, content });
+  $("#runMsg").textContent = `已导出: ${path}`;
+  $("#exportBtn").disabled = false;
+}
+
+// ── 字幕文本构建（SRT / VTT / ASS） ──
+function subLines(s, showOrig) {
+  const spk = s.speaker ? `【${s.speaker}】` : "";
+  if (showOrig && s.original && s.translated) {
+    return [spk + s.original, s.translated];
+  }
+  return [spk + (s.translated || s.original)];
+}
+
+function buildSrtContent(subs, showOrig) {
   const lines = [];
   subs.forEach((s, i) => {
     lines.push(String(i + 1));
     lines.push(`${ts(s.start)} --> ${ts(s.end)}`);
-    if (showOrig && s.original && s.translated) {
-      // 原文 + 译文双行（仅有译文时才双行，避免无翻译时原文重复）
-      lines.push(s.original);
-      lines.push(s.translated);
-    } else {
-      lines.push(s.translated || s.original);
-    }
+    lines.push(...subLines(s, showOrig));
     lines.push("");
   });
-  await invoke("save_text_file", { path, content: lines.join("\n") });
-  $("#runMsg").textContent = `已导出: ${path}`;
-  $("#exportBtn").disabled = false;
+  return lines.join("\n");
+}
+
+function vttTs(sec) {
+  // 用总毫秒数整体计算并进位，避免 (sec%60).toFixed 出现 "60.000" 非法时间码
+  const ms = Math.round(sec * 1000);
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const f = String(ms % 1000).padStart(3, "0");
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${f}`;
+}
+
+function buildVttContent(subs, showOrig) {
+  const lines = ["WEBVTT", ""];
+  subs.forEach((s) => {
+    lines.push(`${vttTs(s.start)} --> ${vttTs(s.end)}`);
+    lines.push(...subLines(s, showOrig));
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+function assTs(sec) {
+  // 用总厘秒数整体计算并进位，避免 (sec%1)*100 四舍五入到 100 的非法时间码
+  const cs = Math.round(sec * 100);
+  const h = Math.floor(cs / 360000);
+  const m = Math.floor((cs % 360000) / 6000);
+  const s = Math.floor((cs % 6000) / 100);
+  const f = String(cs % 100).padStart(2, "0");
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${f}`;
+}
+
+function buildAssContent(subs, showOrig) {
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Microsoft YaHei,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,60,60,48,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+  const lines = [header];
+  for (const s of subs) {
+    const text = subLines(s, showOrig)
+      .map((t) => t.replace(/\{/g, "（").replace(/\}/g, "）").replace(/\r/g, ""))
+      .join("\\N");
+    if (!text) continue;
+    lines.push(`Dialogue: 0,${assTs(s.start)},${assTs(s.end)},Default,,0,0,0,,${text}`);
+  }
+  return lines.join("\n");
+}
+
+// ── 硬字幕烧录（③） ──
+async function burnSubtitles() {
+  if (!state.videoPath) {
+    $("#runMsg").textContent = "请先打开视频";
+    return;
+  }
+  if (!state.subtitles.length) {
+    $("#runMsg").textContent = "没有可烧录的字幕（先识别或导入字幕）";
+    return;
+  }
+  const path = await saveDialog({
+    defaultPath: "subtitled.mp4",
+    filters: [{ name: "MP4 视频", extensions: ["mp4"] }],
+  });
+  if (!path) return;
+  const btn = $("#burnBtn");
+  btn.disabled = true;
+  try {
+    // 等待后台流水线结束，避免烧录中途字幕还在变（1 小时兜底超时）
+    if (stream.running && !stream.done) {
+      if (!(await waitUntil(() => stream.done, 200, 60 * 60 * 1000))) {
+        $("#runMsg").textContent = "等待字幕生成超时，已取消烧录";
+        return;
+      }
+    }
+    if (stream.pumping || stream.processing) {
+      if (!(await waitUntil(() => !stream.pumping && !stream.processing, 200, 60 * 60 * 1000))) {
+        $("#runMsg").textContent = "等待字幕生成超时，已取消烧录";
+        return;
+      }
+    }
+    const sorted = [...state.subtitles].sort((a, b) => a.start - b.start);
+    const srt = buildSrtContent(sorted, $("#showOrig").checked);
+    const total = $("#video").duration || stream.total;
+    const out = await invoke("burn_subtitles", {
+      videoPath: state.videoPath,
+      srtContent: srt,
+      outPath: path,
+      fontSize: parseInt($("#burnFontSize").value, 10) || 18,
+      marginV: parseInt($("#burnMarginV").value, 10) || 24,
+      position: $("#burnPosition").value,
+      totalSec: total || 0,
+      preset: $("#burnPreset").value || "custom",
+      fontColor: $("#burnFontColor").value || "white",
+      outlineColor: $("#burnOutlineColor").value || "black",
+    });
+    $("#runMsg").textContent = `烧录完成: ${out}`;
+  } catch (err) {
+    console.error("[subtrans] burn_subtitles failed:", err);
+    $("#runMsg").textContent = `烧录失败: ${err}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── 导入字幕（③） ──
+async function importSubtitleFile(replace) {
+  const path = await openDialog({
+    filters: [
+      { name: "字幕文件", extensions: ["srt", "vtt"] },
+    ],
+  });
+  if (!path) return;
+  try {
+    const subs = await invoke("parse_subtitle_file", { path });
+    if (!Array.isArray(subs) || !subs.length) {
+      $("#runMsg").textContent = "字幕文件里没有条目";
+      return;
+    }
+    pushUndo();
+    if (replace) state.subtitles = [];
+    const mapped = subs.map((s) => ({
+      index: 0,
+      start: +s.start,
+      end: +s.end,
+      original: String(s.original ?? ""),
+      translated: String(s.translated ?? ""),
+    }));
+    // 导入自身已推过撤销快照，追加不再重复入栈（一次 Ctrl+Z 完整撤回导入）
+    appendSubtitles(mapped, { noUndo: true });
+    goStep(3);
+    $("#runMsg").textContent = `已导入 ${mapped.length} 条字幕${replace ? "（已替换）" : "（已追加）"}`;
+    markDirty();
+  } catch (err) {
+    console.error("[subtrans] parse_subtitle_file failed:", err);
+    $("#runMsg").textContent = `导入失败: ${err}`;
+  }
+}
+
+// ── 时间轴工具包（④） ──
+function applyShift() {
+  const ms = Number($("#shiftMs").value);
+  if (!Number.isFinite(ms)) {
+    $("#runMsg").textContent = "请输入有效的偏移毫秒数（如 500 或 -300）";
+    return;
+  }
+  if (ms === 0) {
+    $("#runMsg").textContent = "偏移为 0，无需处理";
+    return;
+  }
+  const delta = ms / 1000;
+  pushUndo();
+  let n = 0;
+  for (const s of state.subtitles) {
+    const dur = s.end - s.start;
+    const ns = Math.max(0, s.start + delta);
+    s.start = ns;
+    s.end = ns + dur;
+    n++;
+  }
+  state.subtitles.sort((a, b) => a.start - b.start);
+  markDirty();
+  refreshSubList();
+  $("#runMsg").textContent = `已整体偏移 ${ms}ms（${n} 条）`;
+}
+
+function applyFps() {
+  const from = Number($("#fpsFrom").value);
+  const to = Number($("#fpsTo").value);
+  if (!from || !to) {
+    $("#runMsg").textContent = "请选择源/目标帧率";
+    return;
+  }
+  if (from === to) {
+    $("#runMsg").textContent = "源/目标帧率相同，无需转换";
+    return;
+  }
+  const ratio = from / to;
+  pushUndo();
+  let n = 0;
+  for (const s of state.subtitles) {
+    s.start *= ratio;
+    s.end *= ratio;
+    n++;
+  }
+  markDirty();
+  refreshSubList();
+  $("#runMsg").textContent = `已按 ${from} → ${to} 重算时间码（${n} 条）`;
+}
+
+function applyReplace() {
+  const find = $("#findText").value;
+  if (!find) {
+    $("#runMsg").textContent = "请输入要查找的文本";
+    return;
+  }
+  const rep = $("#replaceText").value;
+  // 先探测命中再入撤销栈：无命中时不应制造"Ctrl+Z 没反应"的假象
+  const hasHit = state.subtitles.some(
+    (s) => s.original.includes(find) || (s.translated || "").includes(find)
+  );
+  if (!hasHit) {
+    $("#runMsg").textContent = `没有找到「${find}」`;
+    return;
+  }
+  pushUndo();
+  let hits = 0;
+  for (const s of state.subtitles) {
+    if (s.original.includes(find)) {
+      s.original = s.original.split(find).join(rep);
+      hits++;
+    }
+    if (s.translated && s.translated.includes(find)) {
+      s.translated = s.translated.split(find).join(rep);
+      hits++;
+    }
+  }
+  markDirty();
+  refreshSubList();
+  $("#runMsg").textContent = `已替换 ${hits} 处`;
+}
+
+// ── 翻译现有字幕 / 单条重译（第二批 ①） ──
+async function retranslateOne(idx) {
+  const s = state.subtitles[idx];
+  if (!s || !s.original.trim()) return;
+  const btn = rowFor(idx)?.querySelector('[data-act="retr"]');
+  if (btn) btn.disabled = true;
+  try {
+    const t = await invoke("translate_text", {
+      text: s.original,
+      targetLang: $("#targetLang").value,
+      engine: currentEngine(),
+      sourceLang: $("#sourceLang").value || null,
+      glossary: $("#glossary").value || "",
+    });
+    // 翻译期间条目可能已被删除/合并：对象已脱离数组则丢弃结果
+    if (!state.subtitles.includes(s)) {
+      $("#runMsg").textContent = "该条目已被删除，重译结果已丢弃";
+      return;
+    }
+    pushUndo();
+    s.translated = t;
+    markDirty();
+    refreshSubList();
+  } catch (err) {
+    console.error("[subtrans] retranslate failed:", err);
+    $("#runMsg").textContent = `重译失败: ${err}`;
+  }
+}
+
+async function batchTranslate() {
+  const targets = state.subtitles.filter((s) => !s.translated && s.original.trim());
+  if (!targets.length) {
+    $("#runMsg").textContent = "没有需要翻译的条目（都有译文了）";
+    return;
+  }
+  const engine = currentEngine();
+  const targetLang = $("#targetLang").value;
+  const sourceLang = $("#sourceLang").value || null;
+  const glossary = $("#glossary").value || "";
+  const btn = $("#batchTranslateBtn");
+  btn.disabled = true;
+  const pool = 6;
+  const queue = [...targets];
+  let done = 0;
+  let failed = 0;
+  pushUndo();
+  const worker = async () => {
+    while (queue.length) {
+      const s = queue.shift();
+      try {
+        const t = await invoke("translate_text", {
+          text: s.original,
+          targetLang,
+          engine,
+          sourceLang,
+          glossary,
+        });
+        s.translated = t;
+      } catch (e) {
+        failed++;
+        console.error("[subtrans] batch translate item failed:", e);
+      }
+      done++;
+      $("#runMsg").textContent = `翻译现有字幕 ${done}/${targets.length}${failed ? `（失败 ${failed}）` : ""}`;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(pool, targets.length) }, worker));
+  btn.disabled = false;
+  markDirty();
+  refreshSubList();
+  $("#runMsg").textContent = `批量翻译完成：${targets.length - failed}/${targets.length} 条`;
+}
+
+// ── 说话人标注（第二批 ④） ──
+function assignSpeaker(label) {
+  const i = currentSubIndex();
+  if (i < 0) {
+    $("#runMsg").textContent = "当前没有播放中的字幕，先播放到某条字幕";
+    return;
+  }
+  const s = state.subtitles[i];
+  // 与当前标注一致时不入撤销栈（避免无变化操作制造"Ctrl+Z 没反应"）
+  if ((s.speaker || "") === label) {
+    $("#runMsg").textContent = label ? `当前字幕已是「${label}」` : "当前字幕没有说话人标注";
+    return;
+  }
+  pushUndo();
+  if (label) {
+    s.speaker = label;
+    $("#runMsg").textContent = `已把当前字幕标注为「${label}」`;
+  } else {
+    delete s.speaker;
+    $("#runMsg").textContent = "已清除当前字幕的说话人标注";
+  }
+  markDirty();
+  refreshSubList();
+}
+
+// ── 字幕质检（第二批 ④） ──
+function checkSubtitles() {
+  const issues = [];
+  const subs = state.subtitles;
+  const CPS_MAX = 12; // 读速上限：字符/秒（中文 4-6 字/秒为舒适，12 为宽限）
+  for (let i = 0; i < subs.length; i++) {
+    const s = subs[i];
+    const dur = s.end - s.start;
+    if (dur <= 0) {
+      issues.push({ idx: i, type: "时长无效", msg: `${fmt(s.start)} 时长≤0` });
+      continue;
+    }
+    if (dur < 0.2) issues.push({ idx: i, type: "过短", msg: `${fmt(s.start)} 时长 ${dur.toFixed(2)}s < 0.2s` });
+    const text = (s.translated || s.original || "").replace(/\s/g, "");
+    const cps = text.length / dur;
+    if (cps > CPS_MAX) issues.push({ idx: i, type: "读速过快", msg: `${fmt(s.start)} ${cps.toFixed(1)} 字/秒（>${CPS_MAX}）` });
+    if (i > 0) {
+      const p = subs[i - 1];
+      if (s.start < p.end - 0.02) issues.push({ idx: i, type: "重叠", msg: `${fmt(p.start)} 与下一条重叠 ${((p.end - s.start) * 1000).toFixed(0)}ms` });
+    }
+  }
+  const el = $("#qcResults");
+  if (!issues.length) {
+    el.innerHTML = '<div class="muted small">✓ 未发现明显问题</div>';
+    $("#runMsg").textContent = "质检通过";
+    return;
+  }
+  el.innerHTML = "";
+  for (const it of issues) {
+    const d = document.createElement("div");
+    d.className = "qc-item";
+    const t = document.createElement("span");
+    t.className = "qc-type";
+    t.textContent = it.type;
+    const m = document.createElement("span");
+    m.className = "qc-msg";
+    m.textContent = it.msg;
+    d.append(t, m);
+    d.addEventListener("click", () => {
+      // 质检后列表可能已被编辑：点击定位前做越界保护
+      const sub = state.subtitles[it.idx];
+      if (!sub) return;
+      $("#video").currentTime = sub.start;
+      $("#subsDrawer").classList.remove("hidden");
+    });
+    el.appendChild(d);
+  }
+  $("#runMsg").textContent = `质检发现 ${issues.length} 个问题（点击定位）`;
+}
+
+function fixOverlaps() {
+  // 先探测是否有重叠：无重叠不推撤销栈（避免"Ctrl+Z 没反应"的假象）
+  const hasOverlap = state.subtitles.some(
+    (s, i) => i > 0 && s.start < state.subtitles[i - 1].end - 0.02
+  );
+  if (!hasOverlap) {
+    $("#runMsg").textContent = "没有发现重叠";
+    return;
+  }
+  // 快照必须在修改前推入
+  pushUndo();
+  let fixed = 0;
+  for (let i = 1; i < state.subtitles.length; i++) {
+    const s = state.subtitles[i];
+    const p = state.subtitles[i - 1];
+    if (s.start < p.end - 0.02) {
+      s.start = Math.max(0, p.end - 0.05);
+      // 完全被包含/严重重叠：保底最小时长，绝不产生 start>end
+      if (s.end <= s.start) s.end = s.start + 0.2;
+      fixed++;
+    }
+  }
+  state.subtitles.sort((a, b) => a.start - b.start); // 修复可能扰动顺序，重排保证二分查找有效
+  markDirty();
+  refreshSubList();
+  $("#runMsg").textContent = `已修复 ${fixed} 处重叠`;
+}
+
+// ── 视频信息（第二批 ③） ──
+async function loadVideoInfo() {
+  const vp = state.videoPath;
+  if (!vp) return;
+  try {
+    const info = await invoke("video_info", { videoPath: vp });
+    if (state.videoPath !== vp) return; // 等待期间已切换视频：丢弃旧结果
+    const el = $("#videoInfo");
+    if (!info || !info.ok) {
+      el.textContent = "无法读取视频信息（ffprobe 不可用）";
+      return;
+    }
+    const parts = [];
+    if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
+    if (info.fps) parts.push(`${info.fps.toFixed(3).replace(/\.?0+$/, "")}fps`);
+    if (info.video_codec) parts.push(String(info.video_codec).toUpperCase());
+    if (info.audio_codec) parts.push(`音频 ${String(info.audio_codec).toUpperCase()}`);
+    if (info.duration_sec) parts.push(fmt(info.duration_sec));
+    if (info.size_mb != null) parts.push(`${info.size_mb.toFixed(0)}MB`);
+    el.textContent = parts.join(" · ");
+  } catch (e) {
+    console.error("[subtrans] video_info failed:", e);
+    $("#videoInfo").textContent = "无法读取视频信息";
+  }
 }
 
 // 判断 [s, e) 窗口是否被现有字幕完整覆盖（合并重叠段后逐段检查，不能“窗口里有一条就算覆盖”）
@@ -1005,3 +2264,32 @@ function escapeHtml(str) {
 }
 
 boot();
+
+// ═══════════ 影院外壳交互（方案 A 新增：仅浮层开关，不触碰既有逻辑） ═══════════
+{
+  const overlay = $("#settingsOverlay");
+  const drawer = $("#subsDrawer");
+  const openSettings = () => overlay.classList.remove("hidden");
+  const closeSettings = () => overlay.classList.add("hidden");
+  const openDrawer = () => drawer.classList.remove("hidden");
+  const closeDrawer = () => drawer.classList.add("hidden");
+
+  $("#settingsBtn").addEventListener("click", openSettings);
+  $("#settingsClose").addEventListener("click", closeSettings);
+  $("#settingsBackdrop").addEventListener("click", closeSettings);
+  $("#subsBtn").addEventListener("click", openDrawer);
+  $("#subsClose").addEventListener("click", closeDrawer);
+  $("#openDrawerFromPanel").addEventListener("click", openDrawer);
+  // 点击 GPU 徽章直达引擎状态
+  $("#gpuBadge").addEventListener("click", openSettings);
+  // Esc 关闭浮层
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeSettings();
+      closeDrawer();
+    }
+  });
+  // 自动保存兜底：修改后 3s（markDirty）+ 每 30s 周期 + 关闭前尽力保存
+  setInterval(() => saveAutosave(), 30 * 1000);
+  window.addEventListener("beforeunload", () => saveAutosave());
+}

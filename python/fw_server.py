@@ -2,7 +2,8 @@
 """faster-whisper 常驻识别服务（行协议）。
 
 由 Rust 后端启动一次，把模型常驻显存，然后逐行处理请求：
-  stdin  : 每行一个 JSON，如 {"audio": "C:/path/chunk.wav", "language": "zh"}
+  stdin  : 每行一个 JSON，如 {"audio": "C:/path/chunk.wav", "language": "zh",
+           "hotwords": "张三 李四"}（hotwords 可选：术语表热词，faster-whisper v1.0+ 支持）
            或 {"cmd": "quit"}
   stdout : 每行一个 JSON，如 {"segments": [{"start":..,"end":..,"text":..}, ...]}
            启动就绪时先输出 {"ready": true}；出错输出 {"error": "..."}
@@ -11,6 +12,7 @@
   例:  python fw_server.py large-v3 cuda float16 C:/path/to/models
 """
 import os
+import re
 import sys
 import json
 
@@ -67,6 +69,35 @@ def resolve_model(name, model_root=None):
     return name, False
 
 
+def _transcribe(model, audio, lang, separated, vad_enabled, hotwords_raw):
+    """调用 faster-whisper 识别一个分片。
+
+    hotwords（术语表热词）是 v1.0+ 才有的参数：老版本没有该关键字时自动降级为
+    不带热词识别，避免 TypeError 让整个分片失败。
+    """
+    kwargs = dict(
+        language=lang,
+        beam_size=5,
+        # VAD：已分离人声轨必开；未分离音频按用户开关决定（音乐多的视频建议开，
+        # 纯唱歌/歌词视频可关，避免 Silero 把歌声当“非语音”切掉）
+        vad_filter=separated or vad_enabled,
+        condition_on_previous_text=False,  # 禁止幻觉传播
+        # 0.4 为项目原值：轻声/带背景音乐的人声也能正常识别
+        no_speech_threshold=0.4,
+    )
+    # 术语表在 Rust 端是逗号分隔（中英文逗号/顿号/分号混用），统一成空格分隔的提示词
+    hotwords = " ".join(w for w in re.split(r"[,，、;；\s]+", hotwords_raw or "") if w)
+    if not hotwords:
+        return model.transcribe(audio, **kwargs)
+    try:
+        return model.transcribe(audio, hotwords=hotwords, **kwargs)
+    except TypeError as e:
+        if "hotwords" not in str(e):
+            raise
+        # 旧版 faster-whisper 无 hotwords 参数：忽略术语表继续识别
+        return model.transcribe(audio, **kwargs)
+
+
 def main():
     model_name = sys.argv[1] if len(sys.argv) > 1 else "small"
     device = sys.argv[2] if len(sys.argv) > 2 else "cuda"
@@ -89,6 +120,12 @@ def main():
         try:
             req = json.loads(line)
         except Exception:
+            # 坏 JSON 也回一行错误：否则 Rust 端等不到应答会挂到超时
+            emit({"error": "bad json"})
+            continue
+        if not isinstance(req, dict):
+            # 合法 JSON 但不是对象（字符串/数组/数字）同样不能直接 .get()
+            emit({"error": "request must be a JSON object"})
             continue
         if req.get("cmd") == "quit":
             break
@@ -96,18 +133,9 @@ def main():
         lang = req.get("language") or None
         separated = req.get("separated", False)  # 是否已经过人声分离
         vad_enabled = req.get("vad_enabled", False)  # 未分离音频是否也过滤音乐/静音
+        hotwords = req.get("hotwords") or ""  # 术语表热词（Rust 端已截断防超长）
         try:
-            segments, info = model.transcribe(
-                audio,
-                language=lang,
-                beam_size=5,
-                # VAD：已分离人声轨必开；未分离音频按用户开关决定（音乐多的视频建议开，
-                # 纯唱歌/歌词视频可关，避免 Silero 把歌声当“非语音”切掉）
-                vad_filter=separated or vad_enabled,
-                condition_on_previous_text=False,  # 禁止幻觉传播
-                # 0.4 为项目原值：轻声/带背景音乐的人声也能正常识别
-                no_speech_threshold=0.4,
-            )
+            segments, info = _transcribe(model, audio, lang, separated, vad_enabled, hotwords)
             out = [
                 {"start": float(s.start), "end": float(s.end), "text": s.text}
                 for s in segments

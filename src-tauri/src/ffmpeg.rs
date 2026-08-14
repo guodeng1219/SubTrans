@@ -1,23 +1,30 @@
-//! 从视频中提取音频，供识别引擎使用。
+//! 从视频中提取音频 / 烧录字幕，供识别引擎与导出使用。
 //!
-//! 用系统 ffmpeg 把任意视频转成识别需要的 PCM 音频。app 启动时会尝试把
-//! ffmpeg 目录注入 PATH（见 lib.rs ensure_ffmpeg_on_path），双击启动也能用。
+//! 所有 ffmpeg 子进程一律走 tokio::process（异步等待 + kill_on_drop），
+//! 超时丢弃 future 时子进程会被立刻杀死，不会留下孤儿进程或半成品文件。
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::process::Command;
+use std::sync::{Arc, Mutex};
+use tokio::process::Command;
+
+/// 给 tokio 命令补 Windows CREATE_NO_WINDOW（GUI 程序 spawn 子进程防闪黑窗）。
+/// tokio::process::Command 自带 creation_flags 方法，无需 std 扩展 trait。
+#[cfg(target_os = "windows")]
+fn hide_window(cmd: &mut Command) {
+    cmd.creation_flags(0x0800_0000);
+}
+#[cfg(not(target_os = "windows"))]
+fn hide_window(_cmd: &mut Command) {}
 
 /// 跑 ffmpeg 命令并校验：退出码成功 **且** 输出文件非空。
-/// 失败时带上 ffmpeg stderr 末尾几行，便于定位（无音轨 / 路径异常 / 找不到 ffmpeg 等）。
-fn run_ffmpeg(mut cmd: Command, out_wav: &Path) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        // GUI 程序 spawn 子进程会闪命令行窗口；分片处理频繁调用，用 CREATE_NO_WINDOW 隐藏。
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
+/// tokio 的 output() 会并发读取 stdout+stderr，不存在经典双管道死锁。
+async fn run_ffmpeg(mut cmd: Command, out_wav: &Path) -> Result<()> {
+    hide_window(&mut cmd);
+    cmd.kill_on_drop(true);
     let output = cmd
         .output()
+        .await
         .map_err(|e| anyhow!("启动 ffmpeg 失败: {e}（请确认 ffmpeg 在 PATH 或已安装）"))?;
 
     if !output.status.success() {
@@ -45,24 +52,66 @@ fn stderr_tail(stderr: &[u8]) -> String {
     lines[start..].join(" | ")
 }
 
-/// 调用 ffmpeg 抽取指定时间段的音轨成临时 WAV（16kHz / mono / s16）。
-pub fn extract_audio_range(
+/// 构建提取音频用的滤镜链：高通(去低频乐器/嗡声) → [可选降噪]。
+/// denoise_filter: "afftdn" / "anlmdn" / "arnndn"，其余（含 "none"）不加降噪。
+/// arnndn 只把**文件名**写进滤镜图（滤镜图的单引号机制无法表达路径里的特殊字符，
+/// 如盘符冒号/单引号），模型目录通过 ffmpeg 的 current_dir 指定，见 extract_audio_range。
+fn build_af(denoise_filter: &str, arnndn_model: Option<&Path>) -> Result<String> {
+    let mut af = String::from("highpass=f=80");
+    match denoise_filter {
+        "afftdn" => {
+            // FFT 谱减：nf=-25 是语音降噪常用档位（默认 -50 过于保守）
+            af.push_str(",afftdn=nf=-25");
+        }
+        "anlmdn" => {
+            // 非局部均值：s 为强度（1e-5..10000，默认 1e-5 几乎无效果），
+            // s=1 是适中的语音降噪档位；patch/research/smooth 用默认值
+            af.push_str(",anlmdn=s=1");
+        }
+        "arnndn" => {
+            let model = arnndn_model.ok_or_else(|| anyhow!("arnndn 降噪模型未就绪"))?;
+            let file = model
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| anyhow!("arnndn 模型路径无效"))?;
+            af.push_str(&format!(",arnndn=m={file}"));
+        }
+        _ => {}
+    }
+    Ok(af)
+}
+
+/// 调用 ffmpeg 抽取指定时间段的音轨成临时 WAV（16kHz / mono / s16），
+/// 滤镜链含高通与可选降噪（见 build_af）。
+pub async fn extract_audio_range(
     video_path: &str,
     out_wav: &Path,
     ffmpeg_bin: &str,
     start_sec: f64,
     duration_sec: f64,
+    denoise_filter: &str,
+    arnndn_model: Option<&Path>,
 ) -> Result<()> {
     let out = out_wav.to_str().ok_or_else(|| anyhow!("无效输出路径"))?;
+    let af = build_af(denoise_filter, arnndn_model)?;
+    // arnndn 模型路径只传文件名，把工作目录切到模型所在目录（输入/输出都是绝对路径，不受影响）
+    let model_dir = arnndn_model.and_then(|m| m.parent().map(|p| p.to_path_buf()));
 
-    // 主路径：输入端 -ss 快速 seek + soxr 高质量重采样 + 高通滤波去低频乐器干扰
+    // 主路径：双 -ss（输入端快速 seek + 输出端精确裁剪）——
+    // 仅输入端 -ss 会落在关键帧上，长 GOP 视频窗口会整体前移导致字幕时间轴漂移；
+    // 输出端再 -ss 一次保证从精确的 start_sec 起算。
     let mut cmd = Command::new(ffmpeg_bin);
+    if let Some(dir) = &model_dir {
+        cmd.current_dir(dir);
+    }
     cmd.args([
         "-y",
         "-ss",
         &format!("{start_sec}"),
         "-i",
         video_path,
+        "-ss",
+        &format!("{start_sec}"),
         "-t",
         &format!("{duration_sec}"),
         "-vn",
@@ -71,21 +120,24 @@ pub fn extract_audio_range(
         "-ar",
         "16000",
         "-af",
-        "highpass=f=80",
+        &af,
         "-resampler",
         "soxr",
         "-acodec",
         "pcm_s16le",
         out,
     ]);
-    let primary = run_ffmpeg(cmd, out_wav);
+    let primary = run_ffmpeg(cmd, out_wav).await;
     if primary.is_ok() {
         return Ok(());
     }
 
     // 回退：少数视频在输入端 seek 下音轨“零包”（时间戳异常 / 默认选轨不对 / soxr 不适配该参数）。
-    // 改用更稳的组合：输出端 -ss（精确、必定读包）+ 显式选第一条音轨 + 默认重采样器（swr）。
+    // 改用更稳的组合：纯输出端 -ss（精确、必定读包）+ 显式选第一条音轨 + 默认重采样器（swr）。
     let mut fb = Command::new(ffmpeg_bin);
+    if let Some(dir) = &model_dir {
+        fb.current_dir(dir);
+    }
     fb.args([
         "-y",
         "-i",
@@ -102,19 +154,19 @@ pub fn extract_audio_range(
         "-ar",
         "16000",
         "-af",
-        "highpass=f=80",
+        &af,
         "-acodec",
         "pcm_s16le",
         out,
     ]);
-    run_ffmpeg(fb, out_wav).map_err(|fb_err| {
+    run_ffmpeg(fb, out_wav).await.map_err(|fb_err| {
         // 两条路都失败：把主路径的报错也带上，便于判断是无音轨/编解码不支持还是其它
         anyhow!("{fb_err}（主路径亦失败：{})", primary.unwrap_err())
     })
 }
 
 /// 提取整段音频为 44.1kHz 立体声 WAV，作为 demucs 人声分离的输入（保留更多信息，效果更好）。
-pub fn extract_audio_full(video_path: &str, out_wav: &Path, ffmpeg_bin: &str) -> Result<()> {
+pub async fn extract_audio_full(video_path: &str, out_wav: &Path, ffmpeg_bin: &str) -> Result<()> {
     let mut cmd = Command::new(ffmpeg_bin);
     cmd.args([
         "-y",
@@ -129,7 +181,153 @@ pub fn extract_audio_full(video_path: &str, out_wav: &Path, ffmpeg_bin: &str) ->
         "pcm_s16le",
         out_wav.to_str().ok_or_else(|| anyhow!("无效输出路径"))?,
     ]);
-    run_ffmpeg(cmd, out_wav)
+    run_ffmpeg(cmd, out_wav).await
+}
+
+/// 把 SRT 字幕烧录进视频（硬字幕）。srt 只传文件名，工作目录切到其所在目录
+/// （文件名固定为 subs.srt，不含特殊字符；滤镜图引号机制无法表达 Windows 路径特殊字符）。
+/// font_color/outline_color 为 ASS &HAABBGGRR 字符串；extra_vf 为追加的滤镜链
+/// （如竖屏 scale+pad，空串表示不追加）。进度通过 tokio mpsc 发送 0..100。
+/// stderr 由后台任务持续泄流，避免编码告警（VFR 等）写满管道导致死锁。
+#[allow(clippy::too_many_arguments)] // 参数与 Tauri 命令一一对应，保持扁平便于调用
+pub async fn burn_subtitles(
+    video_path: &str,
+    srt_path: &Path,
+    out_path: &str,
+    ffmpeg_bin: &str,
+    font_size: u32,
+    margin_v: u32,
+    alignment: u32,
+    font_color: &str,
+    outline_color: &str,
+    extra_vf: &str,
+    total_sec: f64,
+    tx: tokio::sync::mpsc::UnboundedSender<f64>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let srt = srt_path.file_name().and_then(|n| n.to_str()).unwrap_or("subs.srt");
+    // Alignment: 2=底部居中 8=顶部居中 5=中间；Outline/Shadow 保证任意画面可读
+    let style = format!(
+        "FontName=Microsoft YaHei,FontSize={font_size},MarginV={margin_v},Outline=2,Shadow=1,Alignment={alignment},PrimaryColour={font_color},OutlineColour={outline_color}"
+    );
+    let mut vf = format!("subtitles={srt}:force_style='{style}'");
+    if !extra_vf.is_empty() {
+        vf.push(',');
+        vf.push_str(extra_vf);
+    }
+
+    // 首选直接拷贝音轨；容器/编码不兼容时回退 AAC 重编码
+    let mut last_err: Option<anyhow::Error> = None;
+    for (idx, audio_codec) in ["copy", "aac"].iter().enumerate() {
+        let mut cmd = Command::new(ffmpeg_bin);
+        if let Some(dir) = srt_path.parent() {
+            cmd.current_dir(dir);
+        }
+        hide_window(&mut cmd);
+        cmd.args([
+            "-y",
+            "-hide_banner",
+            "-i",
+            video_path,
+            "-vf",
+            &vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            audio_codec,
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            out_path,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| anyhow!("启动 ffmpeg 失败: {e}"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法读取 ffmpeg 进度"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("无法读取 ffmpeg 错误输出"))?;
+        // 后台泄流 stderr：编码期间的告警（VFR "Past duration too large" 等）可能成百上千行，
+        // 无人读取会写满管道缓冲（约 4KB）导致 ffmpeg 阻塞 → 死锁
+        let tail: Arc<Mutex<std::collections::VecDeque<String>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        {
+            let tail = tail.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut t = tail.lock().unwrap();
+                    t.push_back(line);
+                    while t.len() > 10 {
+                        t.pop_front();
+                    }
+                }
+            });
+        }
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line == "progress=end" {
+                break;
+            }
+            let t_sec = line
+                .strip_prefix("out_time_us=")
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|us| us / 1_000_000.0)
+                .or_else(|| {
+                    line.strip_prefix("out_time_ms=")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .map(|ms| ms / 1_000.0)
+                })
+                .or_else(|| line.strip_prefix("out_time=").and_then(parse_hhmmss));
+            if let Some(t) = t_sec {
+                if total_sec > 0.0 {
+                    let _ = tx.send((t / total_sec * 100.0).clamp(0.0, 99.0));
+                }
+            }
+        }
+        let status = child.wait().await.map_err(|e| anyhow!("等待 ffmpeg 失败: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        let detail = {
+            let t = tail.lock().unwrap();
+            t.iter().cloned().collect::<Vec<_>>().join(" | ")
+        };
+        last_err = Some(anyhow!(
+            "ffmpeg 烧录失败（退出码 {:?}，编码器 {audio_codec}）: {detail}",
+            status.code()
+        ));
+        if idx == 0 {
+            // 拷贝失败→重编码重试
+            continue;
+        }
+        break;
+    }
+    Err(last_err
+        .unwrap_or_else(|| anyhow!("ffmpeg 烧录失败"))
+        .context("音轨直接拷贝亦失败，已尝试 AAC 重编码"))
+}
+
+/// 解析 "HH:MM:SS.microseconds" 为秒（ffmpeg -progress 的 out_time 格式）
+fn parse_hhmmss(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, format!("0.{b}")),
+        None => (s, "0".to_string()),
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: f64 = parts[0].parse().ok()?;
+    let m: f64 = parts[1].parse().ok()?;
+    let sec: f64 = parts[2].parse().ok()?;
+    let frac: f64 = frac.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + sec + frac)
 }
 
 /// 把 PCM WAV 读成 whisper 需要的 f32 单声道样本（归一化到 [-1, 1]）。
@@ -169,5 +367,17 @@ pub fn read_wav_as_f32(wav_path: &Path) -> Result<Vec<f32>> {
         Ok(mono)
     } else {
         Ok(samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hhmmss;
+
+    #[test]
+    fn hhmmss_parses_ffmpeg_progress_time() {
+        assert!((parse_hhmmss("00:01:02.500000").unwrap() - 62.5).abs() < 1e-9);
+        assert!((parse_hhmmss("01:00:00").unwrap() - 3600.0).abs() < 1e-9);
+        assert!(parse_hhmmss("garbage").is_none());
     }
 }

@@ -67,7 +67,15 @@ async fn download_python_zip(dest: &Path) -> Result<(), String> {
 
     for url in &urls {
         match download_file(url, dest).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // ZIP 魔数 + 体积双校验：镜像"软 404"（HTTP 200 错误页）会被当完整文件
+                let head = std::fs::read(dest).unwrap_or_default();
+                if head.len() > 5_000_000 && head.starts_with(b"PK\x03\x04") {
+                    return Ok(());
+                }
+                let _ = std::fs::remove_file(dest);
+                eprintln!("python_setup: {url}: 下载内容不是有效 ZIP（魔数/体积校验失败）");
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(dest);
                 eprintln!("python_setup: {url}: {e}");
@@ -132,27 +140,35 @@ async fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 /// 用 tar 或 Expand-Archive 解压 zip。
 fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
     // 优先用 tar（Windows 10 1803+ 内置）
-    let tar = std::process::Command::new("tar")
-        .args(["-xf", &zip_path.to_string_lossy(), "-C", &dest_dir.to_string_lossy()])
-        .status();
-    if tar.map(|s| s.success()).unwrap_or(false) {
+    let mut tar = std::process::Command::new("tar");
+    tar.args(["-xf", &zip_path.to_string_lossy(), "-C", &dest_dir.to_string_lossy()]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        tar.creation_flags(0x0800_0000);
+    }
+    if tar.status().map(|s| s.success()).unwrap_or(false) {
         return Ok(());
     }
 
-    // 回退 PowerShell Expand-Archive
+    // 回退 PowerShell Expand-Archive。
+    // 路径通过环境变量（$env:...）传入并用 -LiteralPath：
+    // 用户目录含单引号/空格（如 C:\Users\D'Artagnan）时不再有转义地狱，也不会拼进命令行造成注入。
     let ps_path = find_powershell_exe();
-    let status = std::process::Command::new(&ps_path)
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                zip_path.display(),
-                dest_dir.display()
-            ),
-        ])
-        .status()
-        .map_err(|e| format!("解压失败: {e}"))?;
+    let mut ps = std::process::Command::new(&ps_path);
+    ps.args([
+        "-NoProfile",
+        "-Command",
+        "Expand-Archive -LiteralPath $env:SUBTRANS_ZIP -DestinationPath $env:SUBTRANS_DEST -Force",
+    ])
+    .env("SUBTRANS_ZIP", zip_path)
+    .env("SUBTRANS_DEST", dest_dir);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        ps.creation_flags(0x0800_0000);
+    }
+    let status = ps.status().map_err(|e| format!("解压失败: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -183,8 +199,9 @@ fn configure_embed_pth(py_dir: &Path) -> Result<(), String> {
 
     let content =
         std::fs::read_to_string(&pth_path).map_err(|e| format!("读取 ._pth 失败: {e}"))?;
-    // 把 `#import site` 改成 `import site`
-    let modified = content.replace("#import site", "import site");
+    // 把 `#import site` / `# import site`（含空格变体）改成 `import site`
+    let modified =
+        content.replace("#import site", "import site").replace("# import site", "import site");
     let final_content = if modified == content && !content.contains("import site") {
         // 文件里没有这行，手动追加
         format!("{}\nimport site\n", content)
@@ -442,7 +459,9 @@ pub(crate) async fn torch_cuda_ready(py_exe: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 快速探测 URL 是否可达（HEAD 请求，5s 超时）。
+/// 快速探测 URL 是否可达（5s 超时）。
+/// 部分 wheel 索引对 HEAD 返回 405（GET 正常），HEAD 失败时回退带 Range 的 GET 探测，
+/// 避免 CUDA 镜像被误判不可达而白白降级 CPU torch。
 async fn mirror_reachable(url: &str) -> bool {
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()
     {
@@ -450,8 +469,16 @@ async fn mirror_reachable(url: &str) -> bool {
         Err(_) => return false,
     };
     match client.head(url).send().await {
-        Ok(resp) => resp.status().is_success() || resp.status().is_redirection(),
-        Err(_) => false,
+        Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => true,
+        _ => match client.get(url).header("Range", "bytes=0-0").send().await {
+            Ok(resp) => {
+                // 只取 1 字节的 Range 请求，206 表示服务器正常响应
+                resp.status().is_success()
+                    || resp.status().is_redirection()
+                    || resp.status().as_u16() == 206
+            }
+            Err(_) => false,
+        },
     }
 }
 

@@ -8,7 +8,7 @@
 </head>
 <body>
 
-  <!-- ───────── 首次启动向导 ───────── -->
+  <!-- ───────── 首次启动向导（影院开场式） ───────── -->
   <div id="wizard" class="wizard hidden">
     <div class="wizard-card">
       <div class="wizard-brand">SUBTRANS</div>
@@ -21,42 +21,44 @@
         <div class="model-pick">
           <label class="radio">
             <input type="radio" name="wm" value="large-v3" checked />
-            <span><b>large-v3</b> · 2.9GB · 最高精度，推荐中文</span>
+            <span class="radio-body"><b>large-v3</b><i>2.9GB · 最高精度，推荐中文</i></span>
           </label>
           <label class="radio">
             <input type="radio" name="wm" value="medium" />
-            <span><b>medium</b> · 1.5GB · 中文精度显著提升</span>
+            <span class="radio-body"><b>medium</b><i>1.5GB · 中文精度显著提升</i></span>
           </label>
           <label class="radio">
             <input type="radio" name="wm" value="small" />
-            <span><b>small</b> · 466MB · 速度快</span>
+            <span class="radio-body"><b>small</b><i>466MB · 速度快</i></span>
           </label>
           <label class="radio">
             <input type="radio" name="wm" value="base" />
-            <span><b>base</b> · 142MB · 速度最快</span>
+            <span class="radio-body"><b>base</b><i>142MB · 速度最快</i></span>
           </label>
           <label class="radio">
             <input type="radio" name="wm" value="tiny" />
-            <span><b>tiny</b> · 75MB · 极速，精度低</span>
+            <span class="radio-body"><b>tiny</b><i>75MB · 极速，精度低</i></span>
           </label>
         </div>
         <div class="bar hidden" id="modelBar"><div class="bar-fill"></div></div>
         <div class="muted small" id="modelMsg"></div>
         <div class="wizard-actions">
-          <button class="btn primary" id="dlModelBtn">下载并继续</button>
+          <button class="btn primary full" id="dlModelBtn">下载并继续</button>
         </div>
       </section>
 
-      <!-- 步骤2：离线翻译（可选） -->
+      <!-- 步骤2：翻译方式（可选） -->
       <section class="wizard-step hidden" data-step="1">
         <h2>第二步 · 翻译方式（可选）</h2>
         <p class="muted">默认用免费在线翻译，开箱即用。想完全离线翻译可启用 Ollama。</p>
         <div class="trans-options">
           <div class="opt-card selected" data-opt="free">
+            <div class="opt-icon">🌐</div>
             <div class="opt-title">免费在线翻译</div>
             <div class="opt-desc muted small">无需配置，需联网。推荐先用这个。</div>
           </div>
           <div class="opt-card" data-opt="ollama">
+            <div class="opt-icon">🦙</div>
             <div class="opt-title">离线翻译 (Ollama)</div>
             <div class="opt-desc muted small">完全离线。需安装 Ollama 并下载模型（约 4.7GB）。</div>
           </div>
@@ -71,197 +73,251 @@
         </div>
         <div class="muted small" id="wizardPyStatus" style="margin-top:12px"></div>
         <div class="wizard-actions">
-          <button class="btn primary" id="wizardDone">完成，开始使用</button>
+          <button class="btn primary full" id="wizardDone">完成，开始使用</button>
         </div>
       </section>
     </div>
   </div>
 
-  <!-- ───────── 主界面：步骤导航 + 播放器 + 上下文面板 ───────── -->
+  <!-- ───────── 主界面：全屏影院 + 悬浮层 ───────── -->
   <div id="app" class="app hidden">
 
-    <!-- 左：步骤导航 -->
-    <nav class="stepnav">
-      <div class="nav-brand">
-        <span class="brand-mark">S</span>
-        <span class="brand-text">SubTrans</span>
-      </div>
-
-      <div class="nav-steps">
-        <button class="step-item active" data-step="1">
-          <span class="step-dot">1</span>
-          <span class="step-label">导入视频</span>
-        </button>
-        <button class="step-item" data-step="2">
-          <span class="step-dot">2</span>
-          <span class="step-label">语音识别</span>
-        </button>
-        <button class="step-item" data-step="3">
-          <span class="step-dot">3</span>
-          <span class="step-label">字幕校对</span>
-        </button>
-        <button class="step-item" data-step="4">
-          <span class="step-dot">4</span>
-          <span class="step-label">导出字幕</span>
-        </button>
-      </div>
-
-      <div class="nav-footer">
-        <div class="gpu-badge" id="gpuBadge">
-          <span class="gpu-dot"></span>
-          <span id="gpuBadgeText">检测环境中...</span>
-        </div>
-        <button class="btn small-btn gpu-upgrade-btn hidden" id="gpuUpgradeBtn">⬆ 安装 GPU 加速</button>
-        <div class="gpu-progress hidden" id="gpuProgress">
-          <div class="gpu-progress-bar"><div class="gpu-progress-fill" id="gpuProgressFill"></div></div>
-          <div class="gpu-progress-text muted small" id="gpuProgressText"></div>
-        </div>
-        <div class="gpu-error hidden" id="gpuError">
-          <div class="gpu-error-text small" id="gpuErrorText"></div>
-          <button class="btn small-btn gpu-retry-btn" id="gpuRetryBtn">重试</button>
-        </div>
-      </div>
-    </nav>
-
-    <!-- 中：播放器 -->
+    <!-- 视频舞台（全屏） -->
     <main class="stage">
       <div class="video-wrap" id="videoWrap">
         <video id="video" controls></video>
         <div id="overlay" class="overlay hidden"></div>
         <div class="stage-empty" id="stageEmpty">
           <div class="stage-empty-icon">🎬</div>
-          <div class="stage-empty-text">打开视频开始制作字幕</div>
+          <div class="stage-empty-text">打开视频，开始制作字幕</div>
+          <div class="stage-empty-hint">点击底部控制坞的「打开视频」</div>
         </div>
+      </div>
+      <!-- 波形图（点击/拖动定位，金色区域为已有字幕覆盖） -->
+      <div class="waveform hidden" id="waveformWrap">
+        <canvas id="waveform"></canvas>
       </div>
     </main>
 
-    <!-- 右：上下文面板 -->
-    <aside class="panel">
-      <div class="panel-head">
-        <span class="file-chip" id="fileName">未选择文件</span>
-        <button class="btn ghost small-btn" id="openBtn">打开视频</button>
+    <!-- 顶部悬浮条 -->
+    <header class="topbar">
+      <div class="tb-brand">
+        <span class="brand-mark">S</span>
+        <span class="brand-text">SubTrans</span>
       </div>
+      <span class="file-chip" id="fileName">未选择文件</span>
+      <div class="tb-spacer"></div>
+      <div class="gpu-badge" id="gpuBadge" title="点击查看引擎状态">
+        <span class="gpu-dot"></span>
+        <span id="gpuBadgeText">检测环境中...</span>
+      </div>
+      <button class="icon-btn" id="subsBtn" title="字幕抽屉">字幕</button>
+      <button class="icon-btn" id="settingsBtn" title="设置">⚙ 设置</button>
+    </header>
 
-      <div class="panel-body">
+    <!-- 字幕抽屉（左缘滑出） -->
+    <aside class="drawer hidden" id="subsDrawer">
+      <div class="drawer-head">
+        <span class="drawer-title">字幕<span class="muted small" id="subCount"></span></span>
+        <button class="icon-btn" id="subsClose" title="关闭">✕</button>
+      </div>
+      <div class="drawer-body">
+        <div id="subList" class="sub-list"></div>
+      </div>
+      <div class="drawer-foot">
+        <div class="drawer-foot-row">
+          <label class="check switch-row">
+            <input type="checkbox" id="showOrig" />
+            <span class="switch"></span>
+            <span>视频显示原文</span>
+          </label>
+          <label class="check switch-row">
+            <input type="checkbox" id="showTrans" checked />
+            <span class="switch"></span>
+            <span>视频显示译文</span>
+          </label>
+        </div>
+        <div class="speaker-bar">
+          <span class="muted small">说话人</span>
+          <button class="mini-btn spk-btn" id="spkA">甲</button>
+          <button class="mini-btn spk-btn" id="spkB">乙</button>
+          <button class="mini-btn spk-btn" id="spkC">丙</button>
+          <button class="mini-btn spk-btn" id="spkD">丁</button>
+          <button class="mini-btn spk-btn" id="spkClear">清</button>
+          <span class="muted small" style="margin-left:auto">标注当前播放的字幕（快捷键 1-4 / 0）</span>
+        </div>
+        <div class="shortcut-hint muted small">空格 播放 · ←→ ±1s（Shift 微调）· ↑↓ 跳字幕 · E 编辑 · R 循环本条 · J/K/L 回退/暂停/前进 · Del 删除 · Ctrl+Z/Y 撤销重做 · 双击文本编辑</div>
+      </div>
+    </aside>
 
-        <!-- 步骤 1：导入 -->
-        <section class="step-panel" data-panel="1">
-          <div class="dropzone" id="dropZone">
-            <div class="dropzone-icon">📂</div>
-            <div class="dropzone-title">点击选择视频文件</div>
-            <div class="dropzone-hint muted small">支持 MP4 · MKV · AVI · MOV · WebM · FLV</div>
-          </div>
-          <div class="card">
-            <div class="card-title">工作流程</div>
-            <div class="flow-list">
-              <div class="flow-item"><span class="flow-n">1</span>导入视频并确认文件信息</div>
-              <div class="flow-item"><span class="flow-n">2</span>配置识别与翻译参数，开始处理</div>
-              <div class="flow-item"><span class="flow-n">3</span>查看识别结果，点击字幕可跳转播放</div>
-              <div class="flow-item"><span class="flow-n">4</span>选择显示内容，导出 SRT 字幕文件</div>
-            </div>
-          </div>
-        </section>
+    <!-- 设置浮层（右侧滑入） -->
+    <div class="settings hidden" id="settingsOverlay">
+      <div class="settings-backdrop" id="settingsBackdrop"></div>
+      <div class="settings-panel">
+        <div class="settings-head">
+          <nav class="stepnav">
+            <button class="step-item active" data-step="1">
+              <span class="step-dot">1</span>
+              <span class="step-label">导入视频</span>
+            </button>
+            <button class="step-item" data-step="2">
+              <span class="step-dot">2</span>
+              <span class="step-label">语音识别</span>
+            </button>
+            <button class="step-item" data-step="3">
+              <span class="step-dot">3</span>
+              <span class="step-label">字幕校对</span>
+            </button>
+            <button class="step-item" data-step="4">
+              <span class="step-dot">4</span>
+              <span class="step-label">导出字幕</span>
+            </button>
+          </nav>
+          <button class="icon-btn" id="settingsClose" title="关闭">✕</button>
+        </div>
+        <div class="settings-body">
 
-        <!-- 步骤 2：识别与翻译配置 -->
-        <section class="step-panel hidden" data-panel="2">
-          <div class="card">
-            <div class="card-title">识别设置</div>
-            <div class="field">
-              <label class="field-label">源语言</label>
-              <select id="sourceLang">
-                <option value="">自动检测</option>
-                <option value="zh">中文</option>
-                <option value="en">英文</option>
-                <option value="ja">日文</option>
-                <option value="ko">韩文</option>
-                <option value="fr">法文</option>
-                <option value="de">德文</option>
-                <option value="es">西班牙文</option>
-                <option value="ru">俄文</option>
-                <option value="pt">葡萄牙文</option>
-              </select>
+          <!-- 步骤 1：导入 -->
+          <section class="step-panel" data-panel="1">
+            <div class="dropzone" id="dropZone">
+              <div class="dropzone-icon">📂</div>
+              <div class="dropzone-title">点击选择视频文件</div>
+              <div class="dropzone-hint muted small">支持 MP4 · MKV · AVI · MOV · WebM · FLV</div>
             </div>
-            <div class="field">
-              <label class="field-label">识别模型</label>
-              <select id="whisperModel">
-                <option value="large-v3">large-v3（推荐，2.9GB）</option>
-                <option value="medium">medium（1.5GB）</option>
-                <option value="small">small</option>
-                <option value="base">base</option>
-                <option value="tiny">tiny</option>
-              </select>
+            <div class="card">
+              <div class="card-title">工作流程</div>
+              <div class="flow-list">
+                <div class="flow-item"><span class="flow-n">1</span>导入视频并确认文件信息</div>
+                <div class="flow-item"><span class="flow-n">2</span>配置识别与翻译参数，开始处理</div>
+                <div class="flow-item"><span class="flow-n">3</span>查看识别结果，点击字幕可跳转播放</div>
+                <div class="flow-item"><span class="flow-n">4</span>选择显示内容，导出 SRT 字幕文件</div>
+              </div>
             </div>
-            <div class="muted small" id="engineHint"></div>
-            <div class="field">
-              <label class="check switch-row">
-                <input type="checkbox" id="vadFilter" />
-                <span class="switch"></span>
-                <span>过滤背景音乐 / 纯音乐段（VAD）</span>
-              </label>
-              <div class="muted small">默认关闭（保证对白识别稳定）。仅当音乐干扰严重、出现“把曲子识别成文字”时再开启。</div>
+            <div class="card">
+              <div class="card-title">视频信息</div>
+              <div class="muted small" id="videoInfo" style="line-height:1.7">打开视频后显示分辨率 / 帧率 / 编码等信息。</div>
             </div>
-            <div class="field hidden" id="gpuRecGroup">
-              <label class="check switch-row">
-                <input type="checkbox" id="useFw" />
-                <span class="switch"></span>
-                <span>GPU 加速识别（faster-whisper）</span>
-              </label>
-              <div class="muted small" id="useFwHint"></div>
+            <div class="card">
+              <div class="card-title">项目</div>
+              <div class="py-actions">
+                <button class="btn small-btn" id="openProjectBtn">📂 打开项目</button>
+                <button class="btn small-btn" id="saveProjectBtn">💾 保存项目</button>
+              </div>
+              <div class="muted small" style="line-height:1.6">字幕与设置会自动保存到本地草稿，下次启动自动恢复；也可显式存为 .subtrans 项目文件用于备份或换机。</div>
             </div>
-            <div class="field hidden" id="hiQualityGroup">
-              <label class="check switch-row">
-                <input type="checkbox" id="hiQuality" />
-                <span class="switch"></span>
-                <span>高精度模式（人声分离）</span>
-              </label>
-              <div class="muted small" id="hiQualityHint"></div>
-            </div>
-          </div>
+          </section>
 
-          <div class="card">
-            <div class="card-title">翻译设置</div>
-            <div class="field">
-              <label class="check switch-row">
-                <input type="checkbox" id="transEnabled" checked />
-                <span class="switch"></span>
-                <span>启用翻译</span>
-              </label>
+          <!-- 步骤 2：识别与翻译配置 -->
+          <section class="step-panel hidden" data-panel="2">
+            <div class="card">
+              <div class="card-title">识别设置</div>
+              <div class="field">
+                <label class="field-label">源语言</label>
+                <select id="sourceLang">
+                  <option value="">自动检测</option>
+                  <option value="zh">中文</option>
+                  <option value="en">英文</option>
+                  <option value="ja">日文</option>
+                  <option value="ko">韩文</option>
+                  <option value="fr">法文</option>
+                  <option value="de">德文</option>
+                  <option value="es">西班牙文</option>
+                  <option value="ru">俄文</option>
+                  <option value="pt">葡萄牙文</option>
+                </select>
+              </div>
+              <div class="muted small" id="engineHint"></div>
+              <div class="field">
+                <label class="field-label">音频降噪</label>
+                <select id="denoiseFilter">
+                  <option value="none">关闭（默认推荐，对白干净时最保真）</option>
+                  <option value="afftdn">afftdn · FFT 谱减（快，去白噪声/电流声）</option>
+                  <option value="anlmdn">anlmdn · 非局部均值（宽带噪声更彻底）</option>
+                  <option value="arnndn">arnndn · RNN 神经网络（效果最好，首次自动下载模型）</option>
+                </select>
+                <div class="muted small">只处理识别用的音频，不修改原视频；噪声大的视频再开启。</div>
+              </div>
+              <div class="field">
+                <label class="check switch-row">
+                  <input type="checkbox" id="vadFilter" />
+                  <span class="switch"></span>
+                  <span>过滤背景音乐 / 纯音乐段（VAD）</span>
+                </label>
+                <div class="muted small">默认关闭（保证对白识别稳定）。仅当音乐干扰严重、出现“把曲子识别成文字”时再开启。</div>
+              </div>
+              <div class="field hidden" id="gpuRecGroup">
+                <label class="check switch-row">
+                  <input type="checkbox" id="useFw" />
+                  <span class="switch"></span>
+                  <span>GPU 加速识别（faster-whisper）</span>
+                </label>
+                <div class="muted small" id="useFwHint"></div>
+              </div>
+              <div class="field hidden" id="hiQualityGroup">
+                <label class="check switch-row">
+                  <input type="checkbox" id="hiQuality" />
+                  <span class="switch"></span>
+                  <span>高精度模式（人声分离）</span>
+                </label>
+                <div class="muted small" id="hiQualityHint"></div>
+              </div>
             </div>
-            <div class="field">
-              <label class="field-label">目标语言</label>
-              <select id="targetLang">
-                <option value="zh">译为中文</option>
-                <option value="en">译为英文</option>
-                <option value="ja">译为日文</option>
-                <option value="ko">译为韩文</option>
-              </select>
-            </div>
-            <div class="field">
-              <label class="field-label">翻译引擎</label>
-              <select id="engine">
-                <option value="free">免费在线翻译</option>
-                <option value="deepseek">DeepSeek（高精度）</option>
-                <option value="ollama">本地 Ollama（离线）</option>
-              </select>
-            </div>
-          </div>
 
-          <div class="card">
-            <div class="card-title">AI 纠错</div>
-            <div class="field">
-              <label class="check switch-row">
-                <input type="checkbox" id="correctEnabled" />
-                <span class="switch"></span>
-                <span>智能纠错（修正同音字）</span>
-              </label>
-              <input type="text" id="glossary" placeholder="热词/术语：人名、专有名词，逗号分隔（GPU 识别与纠错都会用到）" />
-              <div class="muted small" id="correctHint"></div>
+            <div class="card">
+              <div class="card-title">翻译设置</div>
+              <div class="field">
+                <label class="check switch-row">
+                  <input type="checkbox" id="transEnabled" checked />
+                  <span class="switch"></span>
+                  <span>启用翻译</span>
+                </label>
+              </div>
+              <div class="field">
+                <label class="field-label">目标语言</label>
+                <select id="targetLang">
+                  <option value="zh">译为中文</option>
+                  <option value="en">译为英文</option>
+                  <option value="ja">译为日文</option>
+                  <option value="ko">译为韩文</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field-label">翻译引擎</label>
+                <select id="engine">
+                  <option value="free">免费在线翻译</option>
+                  <option value="deepseek">DeepSeek（高精度）</option>
+                  <option value="ollama">本地 Ollama（离线）</option>
+                </select>
+              </div>
             </div>
-          </div>
 
-          <details class="card collapsible">
-            <summary class="card-title">引擎配置 <span class="collapse-arrow">▸</span></summary>
-            <div class="card-inner">
+            <div class="card">
+              <div class="card-title">AI 纠错</div>
+              <div class="field">
+                <label class="check switch-row">
+                  <input type="checkbox" id="correctEnabled" />
+                  <span class="switch"></span>
+                  <span>智能纠错（修正同音字）</span>
+                </label>
+                <textarea id="glossary" rows="4" placeholder="术语词典，每行一条（兼容逗号分隔）：
+原词=固定译文（译文中强制替换）
+人名/专有名词（作为识别热词，提升识别准确率）"></textarea>
+                <div class="muted small" id="correctHint"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title">GPU 加速与引擎</div>
+              <div class="gpu-progress hidden" id="gpuProgress">
+                <div class="gpu-progress-bar"><div class="gpu-progress-fill" id="gpuProgressFill"></div></div>
+                <div class="gpu-progress-text muted small" id="gpuProgressText"></div>
+              </div>
+              <div class="gpu-error hidden" id="gpuError">
+                <div class="gpu-error-text small" id="gpuErrorText"></div>
+                <button class="btn small-btn gpu-retry-btn" id="gpuRetryBtn">重试</button>
+              </div>
+              <button class="btn small-btn gpu-upgrade-btn hidden" id="gpuUpgradeBtn">⬆ 安装 GPU 加速</button>
+
               <div class="field hidden" id="pySetupGroup">
                 <label class="field-label">Python 环境（GPU 识别 / 人声分离需要）</label>
                 <input type="text" id="pyPython" placeholder="Python 解释器路径（启动时自动检测）" />
@@ -272,19 +328,17 @@
                 <div class="bar hidden" id="pyBar"><div class="bar-fill" id="pyBarFill"></div></div>
                 <div class="muted small" id="pyStatus"></div>
               </div>
-              <div class="field">
-                <label class="field-label">DeepSeek API</label>
-                <input type="password" id="dsKey" placeholder="sk-..." />
-                <select id="dsModel"><option>deepseek-chat</option></select>
-                <a class="link small" href="https://platform.deepseek.com/api_keys" target="_blank">获取 API Key →</a>
+
+              <div class="field hidden" id="fwCfgGroup">
+                <label class="field-label">GPU 识别 (faster-whisper)</label>
+                <select id="fwDevice">
+                  <option value="cuda">GPU (cuda)</option>
+                  <option value="cpu">CPU</option>
+                </select>
+                <button class="btn small-btn" id="fwCheck">检测 faster-whisper</button>
+                <div class="muted small" id="fwStatus"></div>
               </div>
-              <div class="field">
-                <label class="field-label">本地 Ollama</label>
-                <input type="text" id="olHost" value="http://localhost:11434" />
-                <input type="text" id="olModel" value="qwen2.5:7b" />
-                <button class="btn small-btn" id="testOllama">测试连接</button>
-                <div class="muted small" id="olStatus"></div>
-              </div>
+
               <div class="field hidden" id="demucsCfgGroup">
                 <label class="field-label">人声分离 (demucs)</label>
                 <select id="demucsDevice">
@@ -300,71 +354,198 @@
                 <button class="btn small-btn" id="checkDemucs">检测 demucs</button>
                 <div class="muted small" id="demucsStatus"></div>
               </div>
-              <div class="field hidden" id="fwCfgGroup">
-                <label class="field-label">GPU 识别 (faster-whisper)</label>
-                <select id="fwDevice">
-                  <option value="cuda">GPU (cuda)</option>
-                  <option value="cpu">CPU</option>
+            </div>
+
+            <details class="card collapsible">
+              <summary class="card-title">翻译引擎配置 <span class="collapse-arrow">▸</span></summary>
+              <div class="card-inner">
+                <div class="field">
+                  <label class="field-label">DeepSeek API</label>
+                  <input type="password" id="dsKey" placeholder="sk-..." />
+                  <select id="dsModel"><option>deepseek-chat</option></select>
+                  <a class="link small" href="https://platform.deepseek.com/api_keys" target="_blank">获取 API Key →</a>
+                </div>
+                <div class="field">
+                  <label class="field-label">本地 Ollama</label>
+                  <input type="text" id="olHost" value="http://localhost:11434" />
+                  <input type="text" id="olModel" value="qwen2.5:7b" />
+                  <button class="btn small-btn" id="testOllama">测试连接</button>
+                  <div class="muted small" id="olStatus"></div>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <!-- 步骤 3：字幕校对 -->
+          <section class="step-panel hidden" data-panel="3">
+            <div class="card">
+              <div class="card-title">字幕来源</div>
+              <div class="py-actions">
+                <button class="btn small-btn" id="importSubBtn">📥 导入 SRT/VTT（追加）</button>
+                <button class="btn small-btn" id="importSubReplaceBtn">📥 导入并替换现有</button>
+                <button class="btn small-btn" id="batchTranslateBtn">🌐 翻译未翻译条目</button>
+              </div>
+              <div class="muted small" style="line-height:1.6">可导入已有字幕文件直接校对/翻译，无需重新识别；「翻译未翻译条目」用当前翻译引擎批量补齐译文。</div>
+            </div>
+            <div class="card">
+              <div class="card-title">字幕质检</div>
+              <div class="py-actions">
+                <button class="btn small-btn" id="qcBtn">🔍 检查字幕</button>
+                <button class="btn small-btn" id="fixOverlapBtn">修复重叠</button>
+              </div>
+              <div id="qcResults" class="qc-results"></div>
+            </div>
+            <div class="card">
+              <div class="card-title">时间轴工具</div>
+              <div class="field">
+                <label class="field-label">整体偏移（毫秒，负数提前）</label>
+                <div class="py-actions">
+                  <input type="text" id="shiftMs" placeholder="如 500 或 -300" style="flex:1" />
+                  <button class="btn small-btn" id="applyShiftBtn">应用偏移</button>
+                </div>
+              </div>
+              <div class="field">
+                <label class="field-label">帧率转换（时间码重算）</label>
+                <div class="py-actions">
+                  <select id="fpsFrom" style="flex:1">
+                    <option value="23.976">23.976</option>
+                    <option value="24">24</option>
+                    <option value="25">25</option>
+                    <option value="29.97">29.97</option>
+                    <option value="30">30</option>
+                    <option value="50">50</option>
+                    <option value="59.94">59.94</option>
+                    <option value="60">60</option>
+                  </select>
+                  <span class="muted small">→</span>
+                  <select id="fpsTo" style="flex:1">
+                    <option value="23.976">23.976</option>
+                    <option value="24">24</option>
+                    <option value="25" selected>25</option>
+                    <option value="29.97">29.97</option>
+                    <option value="30">30</option>
+                    <option value="50">50</option>
+                    <option value="59.94">59.94</option>
+                    <option value="60">60</option>
+                  </select>
+                  <button class="btn small-btn" id="applyFpsBtn">转换</button>
+                </div>
+              </div>
+              <div class="field">
+                <label class="field-label">查找 / 替换（原文与译文都生效）</label>
+                <div class="py-actions">
+                  <input type="text" id="findText" placeholder="查找" style="flex:1" />
+                  <input type="text" id="replaceText" placeholder="替换为" style="flex:1" />
+                  <button class="btn small-btn" id="applyReplaceBtn">全部替换</button>
+                </div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">校对</div>
+              <div class="muted small" style="line-height:1.7">字幕实时生成在左侧抽屉：双击文本编辑、点击时间调整、⤵ 合并、⤴ 拆分、✕ 删除、🔄 单条重译。<br />快捷键：空格播放 · ←→ ±1s · ↑↓ 跳字幕 · E 编辑 · R 循环本条 · Del 删除 · 1-4 说话人 · Ctrl+Z/Y 撤销重做。</div>
+              <div style="margin-top:14px">
+                <button class="btn primary" id="openDrawerFromPanel">打开字幕抽屉</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 步骤 4：导出 -->
+          <section class="step-panel hidden" data-panel="4">
+            <div class="card">
+              <div class="card-title">字幕文件导出</div>
+              <div class="field">
+                <label class="field-label">导出格式</label>
+                <select id="exportFormat">
+                  <option value="srt" selected>SRT · 通用，兼容所有播放器</option>
+                  <option value="vtt">VTT · 网页播放器</option>
+                  <option value="ass">ASS · 带样式（字幕组常用）</option>
                 </select>
-                <button class="btn small-btn" id="fwCheck">检测 faster-whisper</button>
-                <div class="muted small" id="fwStatus"></div>
               </div>
-            </div>
-          </details>
-        </section>
-
-        <!-- 步骤 3：字幕校对 -->
-        <section class="step-panel hidden" data-panel="3">
-          <div class="card flush">
-            <div class="card-title">识别结果 <span class="muted small" id="subCount"></span></div>
-            <div id="subList" class="sub-list">
-              <div class="empty">识别后字幕会显示在这里</div>
-            </div>
-          </div>
-        </section>
-
-        <!-- 步骤 4：导出 -->
-        <section class="step-panel hidden" data-panel="4">
-          <div class="card">
-            <div class="card-title">字幕显示内容</div>
-            <div class="field">
-              <label class="check switch-row">
-                <input type="checkbox" id="showOrig" />
-                <span class="switch"></span>
-                <span>包含原文</span>
-              </label>
-            </div>
-            <div class="field">
-              <label class="check switch-row">
-                <input type="checkbox" id="showTrans" checked />
-                <span class="switch"></span>
-                <span>包含译文</span>
-              </label>
-            </div>
-            <div class="muted small">勾选两者时，SRT 中每条字幕显示为「原文 + 译文」双行。</div>
-          </div>
-          <div class="card">
-            <div class="card-title">导出格式</div>
-            <div class="export-info">
-              <div class="export-format">
-                <span class="export-ext">.SRT</span>
-                <span class="muted small">SubRip 字幕 · UTF-8 BOM · 兼容所有播放器</span>
+              <div class="field">
+                <label class="check switch-row">
+                  <input type="checkbox" id="tradOutput" />
+                  <span class="switch"></span>
+                  <span>输出繁体（简体→繁体转换）</span>
+                </label>
               </div>
+              <div class="muted small" style="line-height:1.7">字幕内容（原文 / 译文）由左侧抽屉底部的两个开关控制。<br />导出时点击底部控制坞的「导出 SRT」按钮。</div>
             </div>
-            <button class="btn amber full" id="exportBtn" disabled>导出 SRT 字幕</button>
-          </div>
-        </section>
+            <div class="card">
+              <div class="card-title">硬字幕烧录（内嵌到视频）</div>
+              <div class="field">
+                <label class="field-label">烧录预设</label>
+                <select id="burnPreset">
+                  <option value="custom" selected>自定义</option>
+                  <option value="bilibili">B 站横屏（1080p 底部安全区）</option>
+                  <option value="douyin">抖音竖屏（自动转 1080×1920，大字幕）</option>
+                  <option value="youtube">YouTube（底部安全区）</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field-label">字幕位置</label>
+                <select id="burnPosition">
+                  <option value="bottom" selected>底部（默认）</option>
+                  <option value="top">顶部</option>
+                  <option value="middle">居中</option>
+                </select>
+              </div>
+              <div class="py-actions">
+                <div class="field" style="flex:1">
+                  <label class="field-label">字号（12-96）</label>
+                  <input type="text" id="burnFontSize" value="18" />
+                </div>
+                <div class="field" style="flex:1">
+                  <label class="field-label">边距（0-400px）</label>
+                  <input type="text" id="burnMarginV" value="24" />
+                </div>
+              </div>
+              <div class="py-actions">
+                <div class="field" style="flex:1">
+                  <label class="field-label">字幕颜色</label>
+                  <select id="burnFontColor">
+                    <option value="white" selected>白色</option>
+                    <option value="yellow">黄色</option>
+                    <option value="cyan">青色</option>
+                    <option value="pink">粉色</option>
+                  </select>
+                </div>
+                <div class="field" style="flex:1">
+                  <label class="field-label">描边颜色</label>
+                  <select id="burnOutlineColor">
+                    <option value="black" selected>黑色</option>
+                    <option value="white">白色</option>
+                  </select>
+                </div>
+              </div>
+              <div class="muted small" style="line-height:1.6; margin-bottom:10px">用 ffmpeg 把字幕烧进画面重新编码导出 MP4（H.264）。预设会覆盖字号/边距/位置，抖音预设同时把横屏视频转成竖屏。大视频耗时较长，进度显示在底部控制坞。</div>
+              <button class="btn amber full" id="burnBtn">🎬 烧录字幕导出视频</button>
+            </div>
+          </section>
 
+        </div>
       </div>
+    </div>
 
-      <!-- 底部固定操作区 -->
-      <div class="panel-foot">
+    <!-- 底部控制坞 -->
+    <div class="dock">
+      <div class="dock-progress">
         <div class="bar"><div class="bar-fill" id="runFill"></div></div>
-        <div class="muted small" id="runMsg">就绪</div>
-        <div class="estimate-time muted small" id="estimateTime"></div>
-        <button class="btn primary full" id="startBtn" disabled>▶ 开始识别</button>
+        <div class="dock-msg muted small" id="runMsg">就绪</div>
       </div>
-    </aside>
+      <div class="dock-controls">
+        <button class="btn ghost" id="openBtn">📂 打开视频</button>
+        <select id="whisperModel" class="dock-select">
+          <option value="large-v3">large-v3（推荐，2.9GB）</option>
+          <option value="medium">medium（1.5GB）</option>
+          <option value="small">small</option>
+          <option value="base">base</option>
+          <option value="tiny">tiny</option>
+        </select>
+        <div class="estimate-time muted small" id="estimateTime"></div>
+        <button class="btn amber" id="exportBtn" disabled>导出 SRT</button>
+        <button class="btn primary big" id="startBtn" disabled>▶ 开始识别</button>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="main.js"></script>

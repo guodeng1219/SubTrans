@@ -16,7 +16,18 @@
 - ✅ CPU 语音识别：`whisper-rs`（whisper.cpp 绑定，编译进二进制，零依赖）
 - ✅ GPU 语音识别：faster-whisper（常驻 Python 进程，模型常驻显存，large-v3 也能秒级）
 - ✅ 高精度模式：人声分离（demucs / BS-RoFormer，先抽纯人声轨再识别，应对动漫/影视 BGM）
+- ✅ 音频降噪选项：afftdn / anlmdn / arnndn 三档可选（arnndn 的 RNN 模型构建时内置、缺失则运行时自动下载），噪声大的视频也能识别
 - ✅ 中文 AI 纠错：LLM 按上下文修同音字/错别字（DeepSeek / 本地 Ollama）
+- ✅ 字幕工作站：抽屉里双击编辑原文/译文、点击时间微调、合并/拆分/删除/单条重译，校对快捷键（空格/←→/↑↓/E/R/JKL/Del），循环播放单条字幕，Ctrl+Z/Y 撤销重做
+- ✅ 术语词典：`原词=译文` 映射对在译文中强制替换，源词同时作为识别热词
+- ✅ 翻译现有字幕：导入的字幕用当前引擎批量补齐译文，单条可随时重译
+- ✅ 项目保存：草稿自动保存（重启恢复）+ 显式 .subtrans 项目文件备份/迁移
+- ✅ 导入现有 SRT/VTT 直接校对翻译；导出 SRT/VTT/ASS，可选繁体输出（内置 OpenCC）
+- ✅ 硬字幕烧录：ffmpeg libx264 把字幕烧进画面导出 MP4，内置 B站/抖音竖屏（自动转 1080×1920）/YouTube 预设 + 字幕/描边颜色
+- ✅ 时间轴工具：整体毫秒偏移、帧率转换（23.976/25/29.97…）、全局查找替换
+- ✅ 音频波形图：视频下方显示波形，字幕覆盖区金色标注，点击/拖动定位
+- ✅ 视频信息面板：ffprobe 读取分辨率/帧率/编码/大小
+- ✅ 字幕质检：重叠/读速/过短检查一键定位，重叠一键修复；手动说话人标注（甲乙丙丁，快捷键 1-4，导出带【甲】前缀）
 - ✅ 边播边译流式管线：按时间段分片，边播放边识别 + 翻译，字幕实时叠加
 - ✅ 三种翻译引擎：免费在线 / DeepSeek / 本地 Ollama
 - ✅ 一键安装 Python 环境：下载内嵌版 Python + 装 faster-whisper/demucs/audio-separator/torch
@@ -205,7 +216,8 @@ subtrans/
 │       ├── correct.rs           中文同音字 / 错别字 LLM 纠错
 │       ├── python_setup.rs      一键安装内嵌版 Python + 依赖包
 │       ├── translate.rs         三种翻译引擎
+│       ├── subtitle_parse.rs    SRT/VTT 字幕解析（导入现有字幕）
 │       ├── ollama.rs            Ollama 检测 / 拉模型
-│       └── ffmpeg.rs            音频提取（调用 sidecar ffmpeg）
+│       └── ffmpeg.rs            音频提取 / 降噪 / 硬字幕烧录（调用 sidecar ffmpeg）
 └── .github/workflows/release.yml  跨平台自动打包 CI
 ```

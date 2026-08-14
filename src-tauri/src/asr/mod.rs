@@ -75,6 +75,14 @@ fn dedupe_punct(text: &str) -> String {
     out
 }
 
+/// 是否为纯标点片段（连续重复标点按标点拆分时会被单独切出来，如 "Hello!!!" → "!"）。
+fn is_pure_punct(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            matches!(c, '。' | '！' | '？' | '；' | '，' | '、' | ',' | ';' | '!' | '?' | '.' | '…')
+        })
+}
+
 /// 拆分过长的 segment：Whisper 对连续朗读/唱歌内容可能把一整段话合成一个 segment，
 /// 导致 overlay 一次显示一大坨文字。按标点符号拆成多个子段，时间按字数比例分配。
 pub fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
@@ -119,6 +127,17 @@ pub fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
         // 2) 标点拆完仍超长的片，再按字/词二次切分
         let mut refined: Vec<String> = Vec::new();
         for p in parts {
+            // 连续重复标点会拆出孤立的纯标点片（"Hello!!!" → "Hello!" "!" "!"），
+            // 单独成段按词计数为 0 → 时间分配得到零时长字幕；把它并回前一片，
+            // 文本与原文一致（标点本就相邻），不丢内容也不产生空段。
+            if is_pure_punct(&p) {
+                if let Some(prev) = refined.last_mut() {
+                    prev.push_str(&p);
+                } else {
+                    refined.push(p); // 整段以标点开头：罕见，保留（时间分配有最小 1 单位兜底）
+                }
+                continue;
+            }
             if p.chars().count() <= MAX_CHARS {
                 refined.push(p);
                 continue;
@@ -155,10 +174,11 @@ pub fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
                 p.split_whitespace().count()
             }
         };
-        let total_units: usize = refined.iter().map(|p| unit_of(p)).sum::<usize>().max(1);
+        let total_units: usize = refined.iter().map(|p| unit_of(p).max(1)).sum::<usize>().max(1);
         let mut t = seg.start;
         for (i, text) in refined.iter().enumerate() {
-            let ratio = unit_of(text) as f64 / total_units as f64;
+            // 每片至少 1 单位：纯标点片（西文按词计数为 0）也分到正时长，杜绝 start==end 的零时长字幕
+            let ratio = (unit_of(text).max(1)) as f64 / total_units as f64;
             let sub_dur = dur * ratio;
             let sub_end = if i == refined.len() - 1 { seg.end } else { t + sub_dur };
             out.push(Segment {
@@ -320,5 +340,37 @@ mod tests {
         }]);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].text, "hello world");
+    }
+
+    #[test]
+    fn punctuation_only_parts_never_get_zero_duration() {
+        // "Hello!!!" 按标点拆分会切出孤立的 "!" 片段，不能产生 start==end 的零时长字幕
+        let segs = split_long_segments(vec![Segment {
+            index: 1,
+            start: 0.0,
+            end: 12.0,
+            text: "Hello!!! World".to_string(),
+        }]);
+        for s in &segs {
+            assert!(s.end > s.start, "零时长字幕: {s:?}");
+        }
+        // 标点不能丢：各段拼起来应与拆分前一致（孤立的 "!" 被并回前一片；
+        // 尾片与标点间的空格被既有 trim 逻辑去除，属于拆分前的固有行为）
+        let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "Hello!!!World");
+    }
+
+    #[test]
+    fn leading_punctuation_part_gets_positive_duration() {
+        // 段首纯标点 + 无标点长句：首片按词计数为 0，时间分配必须有最小 1 单位兜底
+        let segs = split_long_segments(vec![Segment {
+            index: 1,
+            start: 0.0,
+            end: 12.0,
+            text: "!!!hello world hello world hello world".to_string(),
+        }]);
+        for s in &segs {
+            assert!(s.end > s.start, "零时长字幕: {s:?}");
+        }
     }
 }

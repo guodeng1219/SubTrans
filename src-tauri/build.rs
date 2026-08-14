@@ -11,9 +11,18 @@ fn download_ffmpeg_if_missing() {
     let ext = if target.contains("windows") { ".exe" } else { "" };
     let name = format!("ffmpeg-{target}{ext}");
     let dest = PathBuf::from("binaries").join(&name);
+    let ffprobe_dest = PathBuf::from("binaries").join(format!("ffprobe-{target}{ext}"));
 
+    // Windows 需要 ffmpeg+ffprobe 双 sidecar；macOS 的 ffmpeg-static 单文件不包含 ffprobe，
+    // 早退条件只查 ffmpeg，否则每次构建都会重复下载约 50MB
+    #[cfg(target_os = "windows")]
+    if dest.exists() && ffprobe_dest.exists() {
+        println!("cargo:warning=ffmpeg/ffprobe sidecars already exist");
+        return;
+    }
+    #[cfg(not(target_os = "windows"))]
     if dest.exists() {
-        println!("cargo:warning=ffmpeg sidecar already exists: {}", dest.display());
+        println!("cargo:warning=ffmpeg sidecar already exists");
         return;
     }
 
@@ -22,11 +31,14 @@ fn download_ffmpeg_if_missing() {
 
     #[cfg(target_os = "windows")]
     {
-        download_ffmpeg_windows(&dest);
+        download_ffmpeg_windows(&dest, &ffprobe_dest);
     }
     #[cfg(target_os = "macos")]
     {
         download_ffmpeg_macos(&dest);
+        println!(
+            "cargo:warning=macOS 不内置 ffprobe（ffmpeg-static 单文件不包含），运行时回退系统 PATH"
+        );
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -68,7 +80,7 @@ fn try_download_zip(urls: &[&str], tmp: &Path) {
 }
 
 #[cfg(target_os = "windows")]
-fn download_ffmpeg_windows(dest: &Path) {
+fn download_ffmpeg_windows(dest: &Path, ffprobe_dest: &Path) {
     let tmp = PathBuf::from("binaries/ffmpeg_temp.zip");
     let extract = PathBuf::from("binaries/ffmpeg_extracted");
 
@@ -83,19 +95,18 @@ fn download_ffmpeg_windows(dest: &Path) {
 
     try_download_zip(&urls, &tmp);
 
-    // Extract
+    // Extract。路径通过环境变量 + -LiteralPath 传入：
+    // 项目目录含单引号/空格（如 D:\Bob's Projects\...）时不再破坏 PowerShell 命令行。
     let ps = find_powershell();
     let _ = std::fs::remove_dir_all(&extract);
     let status = std::process::Command::new(&ps)
         .args([
             "-NoProfile",
             "-Command",
-            &format!(
-                "Expand-Archive -Path '{}' -DestinationPath '{}'",
-                tmp.display(),
-                extract.display()
-            ),
+            "Expand-Archive -LiteralPath $env:SUBTRANS_ZIP -DestinationPath $env:SUBTRANS_DEST",
         ])
+        .env("SUBTRANS_ZIP", &tmp)
+        .env("SUBTRANS_DEST", &extract)
         .status()
         .expect("Failed to extract ffmpeg zip");
     if !status.success() {
@@ -104,14 +115,21 @@ fn download_ffmpeg_windows(dest: &Path) {
 
     let ffmpeg_exe =
         find_in_dir(&extract, "ffmpeg.exe").expect("ffmpeg.exe not found in downloaded archive");
+    let ffprobe_exe =
+        find_in_dir(&extract, "ffprobe.exe").expect("ffprobe.exe not found in downloaded archive");
 
-    std::fs::copy(&ffmpeg_exe, dest).expect("Failed to copy ffmpeg.exe to binaries/");
+    if !dest.exists() {
+        std::fs::copy(&ffmpeg_exe, dest).expect("Failed to copy ffmpeg.exe to binaries/");
+    }
+    if !ffprobe_dest.exists() {
+        std::fs::copy(&ffprobe_exe, ffprobe_dest).expect("Failed to copy ffprobe.exe to binaries/");
+    }
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&extract);
     let _ = std::fs::remove_file(&tmp);
 
-    println!("cargo:warning=ffmpeg sidecar ready: {}", dest.display());
+    println!("cargo:warning=ffmpeg/ffprobe sidecars ready");
 }
 
 #[cfg(target_os = "macos")]
@@ -197,7 +215,7 @@ fn find_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-// ── 内置模型下载（tiny 应急模型 + VAD 模型） ──
+// ── 内置模型下载（tiny 应急模型 + VAD 模型 + arnndn 降噪模型） ──
 
 fn download_models_if_missing() {
     std::fs::create_dir_all("models").ok();
@@ -213,27 +231,52 @@ fn download_models_if_missing() {
         println!("cargo:warning=ggml-tiny.bin already exists");
     }
 
-    let vad = PathBuf::from("models/ggml-silero-v5.1.2.onnx");
+    // whisper.cpp 的 VAD 模型是 ggml 二进制格式（ggml-org/whisper-vad 仓库）
+    let vad = PathBuf::from("models/ggml-silero-v5.1.2.bin");
     if !vad.exists() {
-        println!("cargo:warning=Downloading ggml-silero-v5.1.2.onnx (~2MB)...");
+        println!("cargo:warning=Downloading ggml-silero-v5.1.2.bin (~2MB)...");
         download_file_simple(
-            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-silero-v5.1.2.onnx",
+            "https://hf-mirror.com/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin",
             &vad,
         );
     } else {
-        println!("cargo:warning=ggml-silero-v5.1.2.onnx already exists");
+        println!("cargo:warning=ggml-silero-v5.1.2.bin already exists");
+    }
+
+    // ffmpeg arnndn 降噪模型（abstractive/arnndn-models）。失败不 panic：运行时还会再下载。
+    let arnndn = PathBuf::from("models/cb.rnnn");
+    if !arnndn.exists() {
+        println!("cargo:warning=Downloading cb.rnnn (~300KB)...");
+        download_file_simple(
+            "https://cdn.jsdelivr.net/gh/abstractive/arnndn-models@master/cb.rnnn",
+            &arnndn,
+        );
+    } else {
+        println!("cargo:warning=cb.rnnn already exists");
     }
 }
 
 /// 简单文件下载（用 curl 或 certutil），失败不 panic（模型可在运行时再下载）。
+/// 下载完成后校验体积：错误页/半成品远小于真实模型（最小模型 cb.rnnn 约 300KB），
+/// 太小就丢弃，避免把垃圾文件当模型打进安装包。
 fn download_file_simple(url: &str, dest: &Path) {
     let part = dest.with_extension("part");
+    let commit = |label: &str| -> bool {
+        let ok = part.metadata().map(|m| m.len() > 10_000).unwrap_or(false);
+        if ok {
+            let _ = std::fs::rename(&part, dest);
+            println!("cargo:warning=Downloaded ({label}): {}", dest.display());
+        } else {
+            let _ = std::fs::remove_file(&part);
+        }
+        ok
+    };
     #[cfg(target_os = "windows")]
     {
-        // 优先 curl
+        // 优先 curl（-f：HTTP 404 等错误直接非零退出，避免把错误页当模型）
         let status = std::process::Command::new("curl")
             .args([
-                "-L",
+                "-fL",
                 "-o",
                 part.to_str().unwrap(),
                 url,
@@ -245,19 +288,14 @@ fn download_file_simple(url: &str, dest: &Path) {
                 "-S",
             ])
             .status();
-        if status.map(|s| s.success()).unwrap_or(false) && part.exists() {
-            let _ = std::fs::rename(&part, dest);
-            println!("cargo:warning=Downloaded: {}", dest.display());
+        if status.map(|s| s.success()).unwrap_or(false) && commit("curl") {
             return;
         }
         // 回退 certutil
-        let _ = std::fs::remove_file(&part);
         let status = std::process::Command::new("certutil")
             .args(["-urlcache", "-split", "-f", url, part.to_str().unwrap()])
             .status();
-        if status.map(|s| s.success()).unwrap_or(false) && part.exists() {
-            let _ = std::fs::rename(&part, dest);
-            println!("cargo:warning=Downloaded (certutil): {}", dest.display());
+        if status.map(|s| s.success()).unwrap_or(false) && commit("certutil") {
             return;
         }
     }
@@ -265,7 +303,7 @@ fn download_file_simple(url: &str, dest: &Path) {
     {
         let status = std::process::Command::new("curl")
             .args([
-                "-L",
+                "-fL",
                 "-o",
                 part.to_str().unwrap(),
                 url,
@@ -277,9 +315,7 @@ fn download_file_simple(url: &str, dest: &Path) {
                 "-S",
             ])
             .status();
-        if status.map(|s| s.success()).unwrap_or(false) && part.exists() {
-            let _ = std::fs::rename(&part, dest);
-            println!("cargo:warning=Downloaded: {}", dest.display());
+        if status.map(|s| s.success()).unwrap_or(false) && commit("curl") {
             return;
         }
     }

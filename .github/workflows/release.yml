@@ -59,7 +59,7 @@ jobs:
         working-directory: src-tauri
 
       - name: 安装前端依赖
-        run: npm install
+        run: npm ci
 
       - name: 编译并打包
         uses: tauri-apps/tauri-action@v0
