@@ -23,20 +23,12 @@ fn macos_python_exe() -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
     let parts: Vec<&str> = PYTHON_VERSION.split('.').collect();
     let ver = format!("{}.{}", parts[0], parts.get(1).unwrap_or(&"0"));
-    Ok(home
-        .join("Library")
-        .join("Python")
-        .join(&ver)
-        .join("bin")
-        .join(format!("python{ver}")))
+    Ok(home.join("Library").join("Python").join(&ver).join("bin").join(format!("python{ver}")))
 }
 
 /// 下载官方 pkg 并安装到当前用户目录（无需管理员密码）。
 #[cfg(target_os = "macos")]
-async fn install_macos_python(
-    app: &tauri::AppHandle,
-    data_dir: &Path,
-) -> Result<(), String> {
+async fn install_macos_python(app: &tauri::AppHandle, data_dir: &Path) -> Result<(), String> {
     emit_progress(app, "python_setup", 5.0, "下载 Python 环境（官方安装包，约 45MB）...");
     let pkg = data_dir.join(PYTHON_ARCHIVE);
     download_python_archive(&pkg).await?;
@@ -49,9 +41,7 @@ async fn install_macos_python(
         .map_err(|e| format!("启动 installer 失败: {e}"))?;
     let _ = std::fs::remove_file(&pkg);
     if !status.success() {
-        return Err(
-            "安装 Python 失败（installer 返回非零退出码），请到 python.org 手动安装".into(),
-        );
+        return Err("安装 Python 失败（installer 返回非零退出码），请到 python.org 手动安装".into());
     }
     let exe = macos_python_exe()?;
     if !exe.exists() {
