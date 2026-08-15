@@ -162,41 +162,48 @@ impl PendingWorker {
         }
 
         // 就绪等待：取消用 500ms 轮询（与管线一致的可靠模式），
-        // 取消后旧模型进程在 500ms 内被终止，不会与新任务叠加加载
-        let line = loop {
-            tokio::select! {
-                r = tokio::time::timeout(STARTUP_TIMEOUT, stdout.next_line()) => {
-                    match r {
-                        Ok(Ok(Some(l))) => break l,
-                        Ok(Ok(None)) => {
-                            let _ = child.kill().await;
-                            self.remove_script();
-                            return Err(format!(
-                                "人声分离服务未输出就绪信号（进程已退出）{}",
-                                stderr_diag_of(&self.stderr_tail)
-                            ));
-                        }
-                        Ok(Err(e)) => {
-                            let _ = child.kill().await;
-                            self.remove_script();
-                            return Err(format!("读取就绪信号失败: {e}"));
-                        }
-                        Err(_) => {
-                            let _ = child.kill().await;
-                            self.remove_script();
-                            return Err(format!(
-                                "人声分离服务加载超时（{}s）{}",
-                                STARTUP_TIMEOUT.as_secs(),
-                                stderr_diag_of(&self.stderr_tail)
-                            ));
+        // 取消后旧模型进程在 500ms 内被终止，不会与新任务叠加加载。
+        // 关键：超时 future 只创建并 pin 一次——select! 循环迭代不能重建它，
+        // 否则 180s 加载超时每次都从零起算，卡死的模型加载将永不到期
+        // （只能等外层 2 小时兜底）。内层块结束即释放对 stdout 的借用。
+        let line = {
+            let ready_future = tokio::time::timeout(STARTUP_TIMEOUT, stdout.next_line());
+            tokio::pin!(ready_future);
+            loop {
+                tokio::select! {
+                    r = &mut ready_future => {
+                        match r {
+                            Ok(Ok(Some(l))) => break l,
+                            Ok(Ok(None)) => {
+                                let _ = child.kill().await;
+                                self.remove_script();
+                                return Err(format!(
+                                    "人声分离服务未输出就绪信号（进程已退出）{}",
+                                    stderr_diag_of(&self.stderr_tail)
+                                ));
+                            }
+                            Ok(Err(e)) => {
+                                let _ = child.kill().await;
+                                self.remove_script();
+                                return Err(format!("读取就绪信号失败: {e}"));
+                            }
+                            Err(_) => {
+                                let _ = child.kill().await;
+                                self.remove_script();
+                                return Err(format!(
+                                    "人声分离服务加载超时（{}s）{}",
+                                    STARTUP_TIMEOUT.as_secs(),
+                                    stderr_diag_of(&self.stderr_tail)
+                                ));
+                            }
                         }
                     }
-                }
-                _ = tokio::time::sleep(CANCEL_TICK) => {
-                    if state.is_cancelled(token) {
-                        let _ = child.kill().await;
-                        self.remove_script();
-                        return Err("任务已取消".into());
+                    _ = tokio::time::sleep(CANCEL_TICK) => {
+                        if state.is_cancelled(token) {
+                            let _ = child.kill().await;
+                            self.remove_script();
+                            return Err("任务已取消".into());
+                        }
                     }
                 }
             }

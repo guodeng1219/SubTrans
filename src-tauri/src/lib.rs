@@ -1665,6 +1665,15 @@ async fn separate_vocals_inner(
         .await;
         match &res {
             Ok(path) => {
+                // 发布到会话状态：release_vocal_track / cancel 才能按路径清理这份临时 WAV，
+                // 与 BS-RoFormer 管线一致；令牌过期时 publish_output 自行删除文件并报错
+                if let Err(e) = vocal_state.publish_output(token, PathBuf::from(path)) {
+                    let _ = logger.write(
+                        "task_failed",
+                        &serde_json::json!({"code": "vocal_cancelled", "message": e}),
+                    );
+                    return Err("任务已取消".into());
+                }
                 let _ = logger
                     .write("task_done", &serde_json::json!({"engine": "demucs", "output": path}));
             }
