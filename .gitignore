@@ -28,3 +28,6 @@ src-tauri/target/
 .idea/
 *.swp
 *.swo
+
+# 本地工作笔记（计划/规格/评估素材，不进仓库）
+/docs/
