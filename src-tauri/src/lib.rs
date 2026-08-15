@@ -4,6 +4,7 @@ mod asr;
 mod correct;
 mod ffmpeg;
 mod fw_ipc;
+mod language_profiles;
 mod ollama;
 mod python_setup;
 mod subtitle_parse;
