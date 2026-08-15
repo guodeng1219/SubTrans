@@ -963,14 +963,18 @@ async function startProcess() {
   if ($("#hiQuality").checked) {
     $("#runMsg").textContent = "高精度模式：分离人声中（首次会加载模型，请稍候）...";
     try {
-      stream.audioSource = await invoke("separate_vocals", {
+      const vocals = await invoke("separate_vocals", {
         videoPath: state.videoPath,
         pythonExe: $("#pyPython").value.trim(), // 探测/用户填写的 Python；留空才回退 bundled
         model: $("#demucsModel").value,
         device: $("#demucsDevice").value,
       });
+      // 分离期间会话可能已切换：过期结果/错误都不得触碰新会话状态
+      if (state.session !== sessionAtProc) return;
+      stream.audioSource = vocals;
     } catch (err) {
       console.error("[subtrans] separate_vocals failed:", err);
+      if (state.session !== sessionAtProc) return; // 过期分离的失败不改新会话状态
       // 高精度分离失败：停止识别（绝不静默回退普通音频或 Demucs）。
       // 不取消用户的高精度勾选，用户可查看错误、调整设置后重试。
       stream.running = false;
@@ -1562,6 +1566,12 @@ function collectProject(includeSecret = false) {
 
 async function applyProject(p) {
   if (!p || typeof p !== "object") return false;
+  const sessionAtApply = state.session;
+  const s = p.settings || {};
+  // 先等待预设目录（期间用户可能已切换会话/打开新视频）；
+  // 目录就绪后先校验会话令牌，再修改任何状态——绝不让旧恢复覆盖新会话
+  const rec = await resolveRecognitionSettingsAfterCatalog(s, profilesReady);
+  if (state.session !== sessionAtApply) return false;
   // 字幕（对损坏字段做兜底，不让一个坏条目毁掉整个项目）
   if (Array.isArray(p.subtitles)) {
     state.subtitles = p.subtitles
@@ -1577,7 +1587,6 @@ async function applyProject(p) {
       .sort((a, b) => a.start - b.start);
     refreshSubList();
   }
-  const s = p.settings || {};
   const setVal = (sel, v) => {
     const el = $(sel);
     if (el && v != null) el.value = v;
@@ -1587,9 +1596,6 @@ async function applyProject(p) {
     if (el && v != null) el.checked = !!v;
   };
   setVal("#whisperModel", s.modelName);
-  // 识别设置：等待预设目录就绪后迁移 + 归一化（目录缺该预设时保留 sourceLang
-  // 回退 custom/auto，绝不静默丢失保存值）
-  const rec = await resolveRecognitionSettingsAfterCatalog(s, profilesReady);
   setVal("#recognitionProfile", rec.recognitionProfileId);
   setVal("#accentVariant", rec.accentVariant);
   setVal("#sourceLang", rec.sourceLang);
@@ -1660,7 +1666,13 @@ async function saveAutosave() {
 async function restoreAutosave() {
   try {
     const p = await invoke("load_autosave");
-    if (p && (await applyProject(p))) {
+    if (!p) return;
+    // 恢复期间用户可能已打开新视频/项目：applyProject 内部在目录等待后
+    // 已校验会话令牌，这里再兜底一次，避免把过期的恢复文案贴到新会话上
+    const sessionAtRestore = state.session;
+    const applied = await applyProject(p);
+    if (state.session !== sessionAtRestore) return;
+    if (applied) {
       $("#runMsg").textContent = `已恢复上次会话（${state.subtitles.length} 条字幕）${
         state.videoPath ? "" : "· 原视频已移动，字幕仍保留"
       }`;
@@ -1707,7 +1719,9 @@ async function openProjectDialog() {
     state.subtitles = [];
     resetUndo(); // 打开的项目是全新会话，旧撤销历史不得混入
     state.session++; // 会话令牌：项目可能指向与当前相同的视频，旧分片不得写入新列表
+    const sessionAtOpen = state.session;
     if (await applyProject(p)) {
+      if (state.session !== sessionAtOpen) return; // applyProject 等待目录期间用户又切换了会话
       lastSnapshot = snapshotSubs(); // 以载入状态为撤销基准
       goStep(3);
       $("#runMsg").textContent = `项目已打开（${state.subtitles.length} 条字幕）`;
@@ -2302,10 +2316,14 @@ async function detectEnv() {
             fw_ready: false, demucs_ready: false, audio_sep_ready: false, models: [], bundled_tiny: false };
   }
 
-  const gpuReady = env.has_gpu && env.cuda_torch_ready && (env.fw_ready || env.demucs_ready);
+  const gpuReady = env.has_gpu && env.cuda_torch_ready &&
+    (env.fw_ready || env.demucs_ready || env.audio_sep_ready);
   const cudaInstalled = env.has_gpu && env.cuda_torch_ready; // CUDA torch 已装（不管 fw/demucs 检测结果）
   const fwReady = gpuReady && env.fw_ready;
   const demucsReady = gpuReady && env.demucs_ready;
+  const audioSepReady = gpuReady && env.audio_sep_ready;
+  // 高精度模式只需人声分离引擎之一就绪：demucs 或 BS-RoFormer（audio-separator）
+  const hiQualityReady = demucsReady || audioSepReady;
 
   // 记录/回填 Python 路径（探测结果优先）
   if (env.python_path) {
@@ -2313,9 +2331,14 @@ async function detectEnv() {
     localStorage.setItem("subtrans.pythonPath", env.python_path);
   }
 
+  // 只有 BS-RoFormer 就绪（demucs 缺失）时，模型默认切到 BS-RoFormer（value=""）
+  if (audioSepReady && !demucsReady) {
+    $("#demucsModel").value = "";
+  }
+
   // GPU 选项显示/隐藏
   showGroup("gpuRecGroup", fwReady);
-  showGroup("hiQualityGroup", demucsReady);
+  showGroup("hiQualityGroup", hiQualityReady);
   showGroup("fwCfgGroup", gpuReady);
   showGroup("demucsCfgGroup", gpuReady);
   // Python 安装区：GPU 未就绪时展示，让用户有明确的修复入口

@@ -34,18 +34,25 @@ pub struct VocalState {
 }
 
 impl VocalState {
-    /// 开始新任务：**先换代再清理**——换代先行使所有在飞 publish 立即失败，
-    /// 随后删除上一个会话发布的人声轨，返回新的会话令牌。
+    /// 开始新任务：换代与删除旧发布在**同一锁临界区**内原子完成——
+    /// 旧 begin/cancel 不可能在「换代之后、删除之前」被新任务抢占，
+    /// 从而绝不会误删新任务刚发布的人声轨。
     pub fn begin(&self) -> u64 {
+        let mut guard = self.published_output.lock().unwrap();
         let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.delete_published();
+        if let Some(p) = guard.take() {
+            let _ = std::fs::remove_file(&p);
+        }
         token
     }
 
-    /// 取消当前任务：同样先换代再删除，杜绝「检查令牌后、加锁前取消」的竞态窗口。
+    /// 取消当前任务：同样在锁内先换代再删除，与发布操作线性化。
     pub fn cancel(&self) {
+        let mut guard = self.published_output.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.delete_published();
+        if let Some(p) = guard.take() {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     pub fn is_cancelled(&self, token: u64) -> bool {
@@ -174,8 +181,10 @@ impl WorkerCtx {
         config: &VocalPipelineConfig<'_>,
         logger: &TaskLogger,
     ) -> Result<Self, VocalPipelineError> {
-        let worker =
-            VocalWorker::start(config.python_exe, config.model_dir, config.model, config.device)
+        // 两阶段启动：spawn 后立即取 PID 绑定 Job 硬限——模型加载阶段（ready 之前）
+        // 同样受 115% 软预算约束，而不是等 ready 之后才设限。
+        let pending =
+            VocalWorker::spawn(config.python_exe, config.model_dir, config.model, config.device)
                 .await
                 .map_err(|e| {
                     let code = if e.contains("vocal_model_unavailable") {
@@ -185,15 +194,24 @@ impl WorkerCtx {
                     };
                     VocalPipelineError::new(code, e)
                 })?;
-        let pid = worker
+        let pid = pending
             .pid()
             .ok_or_else(|| VocalPipelineError::new("vocal_worker_start_failed", "worker 无 PID"))?;
         let mut probe = ProcessMemoryProbe::new(pid);
         let physical = probe.total_physical_bytes();
         let budget = effective_memory_budget_bytes(physical);
+        // 硬限先于就绪握手生效：加载模型时分配失败即触发 Job 内存限
         let job = JobGuard::assign(pid, budget)
             .map_err(|e| VocalPipelineError::new("vocal_worker_start_failed", e))?;
         let memory_guard = MemoryGuard::new(budget);
+        let worker = pending.wait_ready().await.map_err(|e| {
+            let code = if e.contains("vocal_model_unavailable") {
+                "vocal_model_unavailable"
+            } else {
+                "vocal_worker_start_failed"
+            };
+            VocalPipelineError::new(code, e)
+        })?;
         let _ = logger.write(
             "worker_started",
             &serde_json::json!({"pid": pid, "physical_bytes": physical, "budget_bytes": budget}),
@@ -719,6 +737,17 @@ mod tests {
         std::fs::write(&path, b"temporary vocals").unwrap();
         state.publish_output(token, path.clone()).unwrap();
         state.release_output();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancel_deletes_published_output() {
+        let state = VocalState::default();
+        let token = state.begin();
+        let path = unique_temp_wav("cancel-vocals");
+        std::fs::write(&path, b"temporary vocals").unwrap();
+        state.publish_output(token, path.clone()).unwrap();
+        state.cancel();
         assert!(!path.exists());
     }
 

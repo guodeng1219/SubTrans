@@ -101,17 +101,75 @@ pub struct VocalWorker {
     script_path: PathBuf,
 }
 
+/// 已 spawn、尚未完成就绪握手的服务。
+/// 调用方在 `wait_ready()` 之前先取 `pid()` 绑定 Job 硬限，
+/// 使**模型加载阶段**同样受内存预算约束（而不是等 ready 之后才设限）。
+pub struct PendingWorker {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
+    script_path: PathBuf,
+}
+
+impl PendingWorker {
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// 等待就绪信号；失败/超时先杀子进程并清理临时脚本。
+    pub async fn wait_ready(mut self) -> Result<VocalWorker, String> {
+        let ready = match tokio::time::timeout(STARTUP_TIMEOUT, self.stdout.next_line()).await {
+            Ok(Ok(Some(l))) => l,
+            Ok(Ok(None)) => {
+                let _ = self.child.kill().await;
+                let _ = std::fs::remove_file(&self.script_path);
+                return Err(format!(
+                    "人声分离服务未输出就绪信号（进程已退出）{}",
+                    stderr_diag_of(&self.stderr_tail)
+                ));
+            }
+            Ok(Err(e)) => {
+                let _ = self.child.kill().await;
+                let _ = std::fs::remove_file(&self.script_path);
+                return Err(format!("读取就绪信号失败: {e}"));
+            }
+            Err(_) => {
+                let _ = self.child.kill().await;
+                let _ = std::fs::remove_file(&self.script_path);
+                return Err(format!(
+                    "人声分离服务加载超时（{}s）{}",
+                    STARTUP_TIMEOUT.as_secs(),
+                    stderr_diag_of(&self.stderr_tail)
+                ));
+            }
+        };
+        match parse_ready(&ready) {
+            Ok(_pid) => Ok(VocalWorker {
+                child: self.child,
+                stdin: self.stdin,
+                stdout: self.stdout,
+                stderr_tail: self.stderr_tail,
+                script_path: self.script_path,
+            }),
+            Err(e) => {
+                let _ = self.child.kill().await;
+                let _ = std::fs::remove_file(&self.script_path);
+                Err(e)
+            }
+        }
+    }
+}
+
 impl VocalWorker {
-    /// 启动服务：写入临时脚本、spawn、等待就绪信号。
-    /// 启动超时或就绪信号异常时先杀子进程再返回错误。
-    pub async fn start(
+    /// spawn 子进程（不等待就绪）：返回的 [`PendingWorker`] 可先取 PID
+    /// 用于在模型加载前绑定 Job 硬限，再调用 `wait_ready()` 完成握手。
+    pub async fn spawn(
         python_exe: &str,
         model_dir: &Path,
         model: &str,
         device: &str,
-    ) -> Result<Self, String> {
-        use tokio::io::AsyncBufReadExt;
-
+    ) -> Result<PendingWorker, String> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -144,7 +202,8 @@ impl VocalWorker {
         let stdin = child.stdin.take().ok_or("无法获取 stdin")?;
         let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
         let stderr = child.stderr.take().ok_or("无法获取 stderr")?;
-        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        use tokio::io::AsyncBufReadExt;
+        let lines = tokio::io::BufReader::new(stdout).lines();
 
         // 后台读取 stderr 尾部（崩溃诊断）
         let stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>> =
@@ -152,6 +211,7 @@ impl VocalWorker {
         {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
                 let mut err_lines = tokio::io::BufReader::new(stderr).lines();
                 loop {
                     match err_lines.next_line().await {
@@ -172,39 +232,7 @@ impl VocalWorker {
             });
         }
 
-        let ready = match tokio::time::timeout(STARTUP_TIMEOUT, lines.next_line()).await {
-            Ok(Ok(Some(l))) => l,
-            Ok(Ok(None)) => {
-                let _ = child.kill().await;
-                let _ = std::fs::remove_file(&script_path);
-                return Err(format!(
-                    "人声分离服务未输出就绪信号（进程已退出）{}",
-                    stderr_diag_of(&stderr_tail)
-                ));
-            }
-            Ok(Err(e)) => {
-                let _ = child.kill().await;
-                let _ = std::fs::remove_file(&script_path);
-                return Err(format!("读取就绪信号失败: {e}"));
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = std::fs::remove_file(&script_path);
-                return Err(format!(
-                    "人声分离服务加载超时（{}s）{}",
-                    STARTUP_TIMEOUT.as_secs(),
-                    stderr_diag_of(&stderr_tail)
-                ));
-            }
-        };
-        match parse_ready(&ready) {
-            Ok(_pid) => Ok(Self { child, stdin, stdout: lines, stderr_tail, script_path }),
-            Err(e) => {
-                let _ = child.kill().await;
-                let _ = std::fs::remove_file(&script_path);
-                Err(e)
-            }
-        }
+        Ok(PendingWorker { child, stdin, stdout: lines, stderr_tail, script_path })
     }
 
     /// 发送一次分离请求（不等待响应；响应由 [`Self::read_response`] 读取）。
@@ -264,10 +292,6 @@ impl VocalWorker {
     /// 立即强杀进程（不清理脚本，交由 Drop/后续 shutdown 兜底）。
     pub async fn kill(&mut self) {
         let _ = self.child.kill().await;
-    }
-
-    pub fn pid(&self) -> Option<u32> {
-        self.child.id()
     }
 
     pub fn stderr_diag(&self) -> String {

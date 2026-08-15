@@ -183,21 +183,24 @@ fn apply_glossary(text: &str, map: &[(String, String)]) -> String {
 /// 自动检测锁定门槛（纯函数）：
 /// - 非 auto 预设不锁定（手动选择优先）；
 /// - 清理后无非空段（静音/纯音乐）不锁定；
-/// - GPU 有概率字段时要求 `>= 0.70`，非有限概率视为不可信；
-/// - CPU 无概率字段时以「至少一个非空段」作为最低对白证据；
+/// - GPU（`engine_reports_probability`）**必须**携带有限且 `>= 0.70` 的概率，
+///   缺失/非法/低概率一律不锁——None 概率是 GPU 的"不可信"，不能当作 CPU 路径处理；
+/// - CPU 不携带概率字段，以「至少一个非空段」作为最低对白证据；
 /// - 检测语言无内置预设（如 es）时返回 None，自动会话保持 auto。
 fn detected_profile_for_chunk(
     profile_id: &str,
     detected_lang: Option<&str>,
     nonempty_segment_count: usize,
     language_probability: Option<f64>,
+    engine_reports_probability: bool,
 ) -> Option<&'static str> {
     if profile_id != "auto" || nonempty_segment_count == 0 {
         return None;
     }
-    if let Some(p) = language_probability {
-        if !p.is_finite() || p < 0.70 {
-            return None;
+    if engine_reports_probability {
+        match language_probability {
+            Some(p) if p.is_finite() && p >= 0.70 => {}
+            _ => return None,
         }
     }
     language_profiles::profile_for_detected_language(detected_lang)
@@ -1196,6 +1199,7 @@ async fn process_chunk_inner(
         detected_lang.as_deref(),
         cleaned_segment_count,
         detected_lang_probability,
+        use_fw,
     )
     .map(str::to_owned);
 
@@ -2770,15 +2774,20 @@ mod tests {
 
     #[test]
     fn automatic_lock_requires_dialogue_and_sufficient_gpu_probability() {
-        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 0, Some(0.99)), None);
-        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(0.69)), None);
-        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(0.70)), Some("en-film"));
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 0, Some(0.99), true), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(0.69), true), None);
+        assert_eq!(
+            detected_profile_for_chunk("auto", Some("en"), 2, Some(0.70), true),
+            Some("en-film")
+        );
         // CPU 没有概率字段：非空清理后分片就是最低对白证据。
-        assert_eq!(detected_profile_for_chunk("auto", Some("ja"), 1, None), Some("ja-film"));
-        assert_eq!(detected_profile_for_chunk("en-film", Some("ja"), 1, Some(0.99)), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("ja"), 1, None, false), Some("ja-film"));
+        assert_eq!(detected_profile_for_chunk("en-film", Some("ja"), 1, Some(0.99), true), None);
         // 非有限概率与无内置预设的语言不锁定
-        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(f64::NAN)), None);
-        assert_eq!(detected_profile_for_chunk("auto", Some("es"), 2, None), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(f64::NAN), true), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("es"), 2, None, false), None);
+        // GPU 概率缺失（None）是"不可信"，不能当作 CPU 路径放行。
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, None, true), None);
     }
 
     #[test]
