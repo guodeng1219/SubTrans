@@ -12,6 +12,7 @@
 
 ### 🎙️ 识别
 
+- **高精度人声分离有界内存改造**：BS-RoFormer 不再整片载入内存——规范 PCM 一次落盘，按 240 秒核心（含左右 5 秒上下文保护区）整数采样切窗、常驻模型逐片分离、整数采样裁剪、FFmpeg 流式拼接；最终人声轨总采样数与规范 PCM 严格一致。进程树内存预算按物理内存分档（4/8/16 GiB，85% 警告一次、100% 终止），超限自动降为 120 秒核心重试一次；Windows 以 Job Object 硬限（软预算 115%）兜底。高精度分离失败**停止识别并明确报错**（不再静默回退普通音频或 demucs）；任务诊断日志（task_id/分片采样范围/内存峰值/降片重试）写入 `subtrans.log`
 - **多语言影视识别预设**：内置六种影视对白预设（中文/English/日本語/한국어/Français/Deutsch）+ 自定义语言；English 含英式/美式口音变体（仅提示词后缀，不做拼写替换）。CPU Whisper 与 GPU faster-whisper 共用同一预设解析（语言/提示词/beam_size），行为对齐。自动检测在首个成功分片后锁定到检测语言对应的内置预设，后续分片不再来回切换；每个后续分片携带最近 3 条原文字幕（≤600 字符）作为有界滚动上下文。项目 schema 升级到 v2（保存 `recognitionProfileId`/`accentVariant`），v1 项目自动迁移（`sourceLang` 映射到对应预设，不常见语言保留为 custom，无数据丢失）
 - **音频降噪三档可选**：afftdn（FFT 谱减）/ anlmdn（非局部均值）/ arnndn（RNN 神经网络，模型自动下载）
 - **修复 VAD 模型**：原 `.onnx` 格式与 whisper.cpp 不兼容且已下线，改用 `ggml-silero-v5.1.2.bin`（CPU 路径 VAD 首次真正可用）
