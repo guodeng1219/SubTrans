@@ -9,6 +9,7 @@ mod ollama;
 mod process_memory;
 mod python_setup;
 mod subtitle_parse;
+mod task_log;
 mod translate;
 mod vocal_chunk;
 mod vocal_worker;
@@ -294,18 +295,87 @@ async fn ensure_vad_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 // ── 进度事件 ──
 
+/// 人声分离的结构化进度字段（`separate` 阶段扩展）。
+#[derive(Clone, Debug)]
+pub(crate) struct VocalProgressFields {
+    pub chunk_index: usize,
+    pub chunk_total: usize,
+    pub memory_bytes: u64,
+    pub memory_peak_bytes: u64,
+    pub memory_budget_bytes: u64,
+    pub retrying_with_smaller_chunks: bool,
+    pub warning: bool,
+}
+
+/// 进度事件：原有 `stage/pct/message` 保持不变，人声分离专用字段可选，
+/// 旧事件不携带时前端按原样处理。
 #[derive(Serialize, Clone)]
 struct ProgressEvent {
     stage: String,
     pct: f64,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_peak_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_budget_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retrying_with_smaller_chunks: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<bool>,
+}
+
+impl ProgressEvent {
+    /// 旧式事件：不带人声分离专用字段（序列化后不含 chunk_index 等键）。
+    fn legacy(stage: &str, pct: f64, message: &str) -> Self {
+        Self {
+            stage: stage.to_string(),
+            pct,
+            message: message.to_string(),
+            chunk_index: None,
+            chunk_total: None,
+            memory_bytes: None,
+            memory_peak_bytes: None,
+            memory_budget_bytes: None,
+            retrying_with_smaller_chunks: None,
+            warning: None,
+        }
+    }
+
+    /// 人声分离结构化事件（stage 固定为 "separate"）。
+    fn vocal(pct: f64, message: &str, fields: VocalProgressFields) -> Self {
+        Self {
+            stage: "separate".to_string(),
+            pct,
+            message: message.to_string(),
+            chunk_index: Some(fields.chunk_index),
+            chunk_total: Some(fields.chunk_total),
+            memory_bytes: Some(fields.memory_bytes),
+            memory_peak_bytes: Some(fields.memory_peak_bytes),
+            memory_budget_bytes: Some(fields.memory_budget_bytes),
+            retrying_with_smaller_chunks: Some(fields.retrying_with_smaller_chunks),
+            warning: Some(fields.warning),
+        }
+    }
 }
 
 pub(crate) fn emit_progress(app: &tauri::AppHandle, stage: &str, pct: f64, message: &str) {
-    let _ = app.emit(
-        "progress",
-        ProgressEvent { stage: stage.to_string(), pct, message: message.to_string() },
-    );
+    let _ = app.emit("progress", ProgressEvent::legacy(stage, pct, message));
+}
+
+/// 人声分离结构化进度：携带分片序号与内存字段，前端据此展示内存占用与降片重试。
+pub(crate) fn emit_vocal_progress(
+    app: &tauri::AppHandle,
+    pct: f64,
+    message: &str,
+    fields: VocalProgressFields,
+) {
+    let _ = app.emit("progress", ProgressEvent::vocal(pct, message, fields));
 }
 
 /// 把失败日志同时输出到控制台（dev 终端的 stderr）和日志文件
@@ -2575,7 +2645,7 @@ pub fn run() {
 mod tests {
     use super::{
         apply_glossary, estimate_time, glossary_hotwords, parse_glossary_mapping,
-        resolve_chunk_profile,
+        resolve_chunk_profile, ProgressEvent, VocalProgressFields,
     };
 
     #[test]
@@ -2625,5 +2695,30 @@ mod tests {
         assert_eq!(p.language.as_deref(), Some("en"));
         assert!(p.initial_prompt.contains("British English"));
         assert!(p.initial_prompt.contains("Mr Pemberton"));
+    }
+
+    #[test]
+    fn legacy_progress_omits_vocal_only_fields() {
+        let event = ProgressEvent::legacy("download_model", 10.0, "loading");
+        let value = serde_json::to_value(event).unwrap();
+        assert!(value.get("chunk_index").is_none());
+    }
+
+    #[test]
+    fn vocal_progress_serializes_memory_and_retry_state() {
+        let event = ProgressEvent::vocal(
+            28.5,
+            "高精度人声分离 7/24",
+            VocalProgressFields {
+                chunk_index: 7,
+                chunk_total: 24,
+                memory_bytes: 5 * 1024 * 1024 * 1024,
+                memory_peak_bytes: 6 * 1024 * 1024 * 1024,
+                memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+                retrying_with_smaller_chunks: false,
+                warning: false,
+            },
+        );
+        assert_eq!(serde_json::to_value(event).unwrap()["chunk_index"], 7);
     }
 }
