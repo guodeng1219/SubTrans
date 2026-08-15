@@ -256,16 +256,18 @@ pub fn resolve_profile(
 
 /// 把预设提示词、滚动上下文与源语言热词合成最终 initial_prompt。
 ///
-/// 预算按 Unicode 字符执行：上下文 ≤600（保留最新的尾部）、热词 ≤400，
-/// 总长 ≤1400。`hotwords` 是已解析的源语言热词（如 `glossary_hotwords` 输出），
-/// 不注入术语表译文。
+/// 预算按 Unicode 字符执行：上下文先按预设行数（`rolling_context_lines`）取最近几行、
+/// 再截断至 ≤600 字符（保留最新尾部），热词 ≤400，总长 ≤1400。
+/// `hotwords` 是已解析的源语言热词（如 `glossary_hotwords` 输出），不注入术语表译文。
 pub fn compose_initial_prompt(
     profile: &ResolvedLanguageProfile,
     context: &str,
     hotwords: &str,
 ) -> String {
+    // 行预算：只保留最近 N 行（前端已按此取上下文，后端兜底再执行一次）
+    let context = keep_last_lines(context, profile.rolling_context_lines);
     // 上下文保留最新的尾部（先到的是旧对白，应被截掉）
-    let context = keep_last_chars(context.trim(), CONTEXT_MAX_CHARS);
+    let context = keep_last_chars(&context, CONTEXT_MAX_CHARS);
     let hotwords = keep_first_chars(hotwords.trim(), HOTWORDS_MAX_CHARS);
 
     let mut parts: Vec<String> = Vec::new();
@@ -279,6 +281,18 @@ pub fn compose_initial_prompt(
         parts.push(hotwords);
     }
     keep_first_chars(&parts.join("\n"), PROMPT_MAX_CHARS)
+}
+
+/// 保留最近 `max` 行非空行（保持原有顺序）。
+fn keep_last_lines(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.len() <= max {
+        return lines.join("\n");
+    }
+    lines[lines.len() - max..].join("\n")
 }
 
 /// 按 Unicode 字符保留开头至多 `max` 个字符。

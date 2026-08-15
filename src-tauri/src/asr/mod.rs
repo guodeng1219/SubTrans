@@ -391,10 +391,7 @@ mod tests {
 
     #[test]
     fn transcription_carries_detected_language() {
-        let result = Transcription {
-            segments: Vec::new(),
-            detected_lang: Some("en".to_string()),
-        };
+        let result = Transcription { segments: Vec::new(), detected_lang: Some("en".to_string()) };
         assert_eq!(result.detected_lang.as_deref(), Some("en"));
     }
 

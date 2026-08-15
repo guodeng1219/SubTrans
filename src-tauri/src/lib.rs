@@ -175,6 +175,22 @@ fn apply_glossary(text: &str, map: &[(String, String)]) -> String {
     out
 }
 
+/// 解析分片识别预设：预设 ID + 口音变体 + 自定义语言，与滚动上下文、已解析的
+/// 源语言热词合成最终提示词。CPU 与 GPU 共用同一结果，保证两条链路对齐。
+/// `source_lang` 仅 `custom` 预设使用；`hotwords` 为 `glossary_hotwords` 的输出。
+fn resolve_chunk_profile(
+    profile_id: &str,
+    accent_variant: &str,
+    source_lang: Option<&str>,
+    context_prompt: &str,
+    hotwords: &str,
+) -> Result<language_profiles::ResolvedLanguageProfile, String> {
+    let mut profile = language_profiles::resolve_profile(profile_id, accent_variant, source_lang)?;
+    profile.initial_prompt =
+        language_profiles::compose_initial_prompt(&profile, context_prompt, hotwords);
+    Ok(profile)
+}
+
 /// 临时文件守护：作用域结束时删除文件。
 /// process_chunk 的临时 wav 在多个失败路径（模型下载失败、识别超时等）可能提前返回，
 /// 统一交给守护对象清理，避免 temp 里堆半成品。
@@ -447,6 +463,10 @@ struct ChunkResult {
     /// 自动检测到的源语言（faster-whisper），供前端提示用户是否误判
     detected_lang: Option<String>,
     detected_lang_probability: Option<f64>,
+    /// 本分片实际使用的预设 ID（auto 模式为检测后锁定的预设）
+    active_profile_id: String,
+    /// 自动检测映射出的内置预设 ID（仅 auto 模式；无对应预设时为 None）
+    detected_profile_id: Option<String>,
     /// 校对失败提示（如 Ollama 模型未拉取）；成功为 None
     warn: Option<String>,
 }
@@ -664,6 +684,9 @@ async fn process_chunk(
     lead_in_sec: f64,
     total_sec: f64,
     source_lang: Option<String>,
+    recognition_profile_id: String,
+    accent_variant: String,
+    context_prompt: String,
     target_lang: String,
     engine: Engine,
     translate_enabled: bool,
@@ -688,6 +711,9 @@ async fn process_chunk(
         lead_in_sec,
         total_sec,
         source_lang,
+        recognition_profile_id,
+        accent_variant,
+        context_prompt,
         target_lang,
         engine,
         translate_enabled,
@@ -720,6 +746,9 @@ async fn process_chunk_inner(
     lead_in_sec: f64,
     total_sec: f64,
     source_lang: Option<String>,
+    recognition_profile_id: String,
+    accent_variant: String,
+    context_prompt: String,
     target_lang: String,
     engine: Engine,
     translate_enabled: bool,
@@ -764,6 +793,15 @@ async fn process_chunk_inner(
     if use_fw {
         check_python_path(&fw_python)?;
     }
+    // 语言预设：解析一次，CPU/GPU 共用同一语言、提示词与解码参数；
+    // 上下文在 compose 内按 Unicode 字符截断（600），热词已由 glossary_hotwords 解析。
+    let profile = resolve_chunk_profile(
+        &recognition_profile_id,
+        &accent_variant,
+        source_lang.as_deref().filter(|s| !s.is_empty()),
+        &context_prompt,
+        &glossary_hotwords(&glossary),
+    )?;
 
     // lead-in 仅用于给 ASR 提供上下文，最终丢弃 start_sec 之前的段
     // 5s 重叠（而非 3s）：给分片边界处的句子更多上下文，减少切断导致的识别错误
@@ -821,7 +859,8 @@ async fn process_chunk_inner(
 
     // 2) 识别
     let t_tr = std::time::Instant::now();
-    let src_owned: Option<String> = source_lang.filter(|s| s != "auto");
+    // 预设解析出的语言：手动预设直接给出；auto/custom(空) 交给模型自动检测
+    let src_owned: Option<String> = profile.language.clone();
     let offset = real_start;
 
     // 术语词典：映射对用于译文强制替换；源词作为 faster-whisper 热词（截断防超长）
@@ -836,7 +875,7 @@ async fn process_chunk_inner(
     };
 
     let mut vad_warn: Option<String> = None;
-    let mut detected_lang: Option<String> = None;
+    let detected_lang: Option<String>; // 延迟初始化：两个 ASR 分支各赋值一次
     let mut detected_lang_probability: Option<f64> = None;
     let segments: Vec<asr::Segment> = if use_fw {
         // faster-whisper：把分片 wav 路径喂给常驻 GPU 服务（模型常驻显存）。
@@ -851,8 +890,8 @@ async fn process_chunk_inner(
             audio_source.is_some(),
             vad_enabled,
             hotwords.as_deref(),
-            None, // Task 4 接入语言预设后填充
-            5,
+            (!profile.initial_prompt.is_empty()).then_some(profile.initial_prompt.as_str()),
+            profile.beam_size,
         )
         .await;
         let detected = transcribe?;
@@ -901,21 +940,26 @@ async fn process_chunk_inner(
         };
         let vad_str = vad_path.as_ref().map(|p| p.to_string_lossy().to_string());
         let lang = src_owned.clone();
+        let initial_prompt =
+            (!profile.initial_prompt.is_empty()).then(|| profile.initial_prompt.clone());
+        let best_of = profile.best_of;
         // options 持有 &str 借用，必须在闭包内用 owned 值构造以满足 spawn_blocking 的 'static 要求
         let transcription = tokio::task::spawn_blocking(move || {
             let options = asr::TranscribeOptions {
                 language: lang.as_deref(),
-                initial_prompt: None, // Task 4 接入语言预设后填充
+                initial_prompt: initial_prompt.as_deref(),
                 threads,
                 time_offset_sec: offset,
                 vad_model_path: vad_str.as_deref(),
-                best_of: 5,
+                best_of,
             };
             eng.transcribe(&audio, options)
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
+        // CPU 自动检测的语言：手动指定时回传该语言，自动时取 whisper 判定
+        detected_lang = transcription.detected_lang;
         transcription.segments
     };
     let transcribe_ms = t_tr.elapsed().as_millis() as u64;
@@ -935,8 +979,11 @@ async fn process_chunk_inner(
     }
 
     // 2.5) 可选：LLM 同音字校对（按上下文整批修正后再翻译）
-    // 告警聚合成列表：VAD 降级/纠错失败/翻译失败都保留，不再互相覆盖
+    // 告警聚合成列表：预设降级/VAD 降级/纠错失败/翻译失败都保留，不再互相覆盖
     let mut warns: Vec<String> = Vec::new();
+    if let Some(w) = profile.warning {
+        warns.push(w);
+    }
     if let Some(w) = vad_warn {
         warns.push(w);
     }
@@ -1047,6 +1094,14 @@ async fn process_chunk_inner(
     };
     let translate_ms = t_tx.elapsed().as_millis() as u64;
 
+    // 自动模式：把检测语言映射为内置预设 ID（无对应预设则保持 auto，不硬切语言）
+    let detected_profile_id = if profile.id == "auto" {
+        language_profiles::profile_for_detected_language(detected_lang.as_deref())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
     let warn = if warns.is_empty() { None } else { Some(warns.join("；")) };
     Ok(ChunkResult {
         segments: out,
@@ -1057,8 +1112,16 @@ async fn process_chunk_inner(
         engine_used: engine_label.to_string(),
         detected_lang,
         detected_lang_probability,
+        active_profile_id: profile.id,
+        detected_profile_id,
         warn,
     })
+}
+
+/// 全部语言识别预设（前端启动时读取，填充下拉框）。
+#[tauri::command]
+fn list_language_profiles() -> Vec<language_profiles::LanguageProfileDto> {
+    language_profiles::all_profiles()
 }
 
 /// 检测 faster-whisper 是否可用 + CUDA 状态。
@@ -2460,6 +2523,7 @@ pub fn run() {
         .manage(AsrCache::default())
         .manage(FwState::default())
         .invoke_handler(tauri::generate_handler![
+            list_language_profiles,
             model_exists,
             download_model,
             process_chunk,
@@ -2506,7 +2570,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_glossary, estimate_time, glossary_hotwords, parse_glossary_mapping};
+    use super::{
+        apply_glossary, estimate_time, glossary_hotwords, parse_glossary_mapping,
+        resolve_chunk_profile,
+    };
 
     #[test]
     fn gpu_estimate_is_faster_than_realtime() {
@@ -2533,5 +2600,27 @@ mod tests {
         assert!(!hw.contains("Zhang San"));
         // 确定性强制替换
         assert_eq!(apply_glossary("这是张三和李四", &map), "这是Zhang San和Li Si");
+    }
+
+    #[test]
+    fn auto_chunk_starts_without_forcing_language() {
+        let p = resolve_chunk_profile("auto", "auto", None, "", "").unwrap();
+        assert_eq!(p.language, None);
+        assert_eq!(p.id, "auto");
+    }
+
+    #[test]
+    fn manual_english_chunk_composes_british_context() {
+        let p = resolve_chunk_profile(
+            "en-film",
+            "en-gb",
+            Some("en"),
+            "Good morning, Mr Pemberton.",
+            "Pemberton=彭伯顿",
+        )
+        .unwrap();
+        assert_eq!(p.language.as_deref(), Some("en"));
+        assert!(p.initial_prompt.contains("British English"));
+        assert!(p.initial_prompt.contains("Mr Pemberton"));
     }
 }
