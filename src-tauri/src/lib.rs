@@ -9,6 +9,7 @@ mod ollama;
 mod python_setup;
 mod subtitle_parse;
 mod translate;
+mod vocal_chunk;
 
 use fw_ipc::FwState;
 
