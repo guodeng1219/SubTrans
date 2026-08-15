@@ -36,19 +36,18 @@ pub struct VocalState {
 }
 
 impl VocalState {
-    /// 开始新任务：换代与删除旧发布在**同一锁临界区**内原子完成——
-    /// 旧 begin/cancel 不可能在「换代之后、删除之前」被新任务抢占，
-    /// 从而绝不会误删新任务刚发布的人声轨。
+    /// 开始新任务：只分配换代令牌，**不**删除旧发布——旧人声轨仍归旧会话所有，
+    /// 由 `cancel()`（显式丢弃）、`publish_output()`（成功发布时原子替换）或
+    /// `release_output()`（归属校验后释放）负责清理。
+    /// 这样预检失败的新任务不会破坏「发布只在成功时被替换」的不变量：
+    /// 令牌先行 + 预检失败 = 旧会话的人声轨原样保留。
     pub fn begin(&self) -> u64 {
-        let mut guard = self.published_output.lock().unwrap();
-        let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(p) = guard.take() {
-            let _ = std::fs::remove_file(&p);
-        }
-        token
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// 取消当前任务：同样在锁内先换代再删除，与发布操作线性化。
+    /// 取消当前任务：换代与删除旧发布在**同一锁临界区**内原子完成——
+    /// 旧 begin/cancel 不可能在「换代之后、删除之前」被新任务抢占，
+    /// 从而绝不会误删新任务刚发布的人声轨。
     pub fn cancel(&self) {
         let mut guard = self.published_output.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -808,6 +807,26 @@ mod tests {
         state.publish_output(token, path.clone()).unwrap();
         state.cancel();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn begin_does_not_delete_previous_published_output() {
+        // 令牌先行 ≠ 销毁旧发布：预检失败的新任务不得破坏旧会话的人声轨，
+        // 只有 cancel()、成功发布或归属释放才删除文件
+        let state = VocalState::default();
+        let token = state.begin();
+        let path = unique_temp_wav("begin-keeps-vocals");
+        std::fs::write(&path, b"previous session vocals").unwrap();
+        state.publish_output(token, path.clone()).unwrap();
+        let new_token = state.begin(); // 新任务只分配令牌（随后可能预检失败）
+        assert!(path.exists());
+        // 新任务成功发布时才替换旧文件
+        let new_path = unique_temp_wav("begin-replaces-vocals");
+        std::fs::write(&new_path, b"new session vocals").unwrap();
+        state.publish_output(new_token, new_path.clone()).unwrap();
+        assert!(!path.exists());
+        assert!(new_path.exists());
+        let _ = std::fs::remove_file(&new_path);
     }
 
     #[test]
