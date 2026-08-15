@@ -38,6 +38,10 @@ const stream = {
   holes: [],         // 被跳过的 [start,end) 区间（seek 重定位 / 分片出错），收尾统一补全
   filling: false,    // 收尾补洞进行中（防多个收尾块重复补）
   consecFails: 0,    // 连续分片失败计数（≥3 停止流水线，防止配置错误时空转）
+  // ── 识别预设会话状态 ──
+  selectedProfileId: "auto", // 用户选择的预设（新会话开始时的快照）
+  lockedProfileId: null,     // auto 模式首个成功分片后锁定的内置预设（手动模式恒 null）
+  accentVariant: "auto",     // 口音变体
 };
 
 // ───────── 识别预设目录（后端唯一真相源，前端只读展示元数据） ─────────
@@ -629,6 +633,7 @@ async function openVideo() {
   stream.holes = [];
   stream.filling = false;
   stream.consecFails = 0;
+  stream.lockedProfileId = null; // 新会话：只清自动锁定，不动用户选择的预设
   resetUndo(); // 旧会话字幕快照不得跨视频生效
   state.session++; // 会话令牌：即使重新打开同一个视频，旧分片也不得写入新列表
   state.videoPath = path;
@@ -679,6 +684,12 @@ function correctionEngine() {
 async function invokeChunk(start, dur) {
   const ce = $("#correctEnabled").checked ? correctionEngine() : null;
   const sessionAtCall = state.session; // 在飞请求返回时可能已切换会话，丢弃旧结果
+  // 识别预设：auto 会话锁定后使用锁定的预设；手动预设直接使用用户选择。
+  // sourceLang 继续发送：custom 预设与版本 1 兼容行为仍依赖它。
+  const selected = $("#recognitionProfile")?.value || "auto";
+  const effectiveProfileId = stream.lockedProfileId || selected;
+  const accentVariant = $("#accentVariant")?.value || "auto";
+  const contextPrompt = buildRollingContext(state.subtitles, 3, 600);
   const res = await invoke("process_chunk", {
     videoPath: state.videoPath,
     audioSource: stream.audioSource,
@@ -688,6 +699,9 @@ async function invokeChunk(start, dur) {
     leadInSec: start > 0 ? 5.0 : 0.0,
     totalSec: stream.total,
     sourceLang: $("#sourceLang").value || null,
+    recognitionProfileId: effectiveProfileId,
+    accentVariant,
+    contextPrompt,
     targetLang: $("#targetLang").value,
     engine: currentEngine(),
     translateEnabled: $("#transEnabled").checked,
@@ -703,6 +717,22 @@ async function invokeChunk(start, dur) {
     fwDevice: $("#fwDevice").value,
   });
   if (state.session !== sessionAtCall) return null; // 已切换会话：丢弃过期结果
+  // 仅当前会话的成功分片可以锁定检测预设：过期分片（会话不匹配）不改锁，
+  // 手动预设永不锁定（helper 内部处理）
+  const nextLock = applyDetectedProfileForSession(
+    state.session,
+    sessionAtCall,
+    selected,
+    stream.lockedProfileId,
+    res.detected_profile_id
+  );
+  if (nextLock !== stream.lockedProfileId) {
+    stream.lockedProfileId = nextLock;
+    if (nextLock) {
+      const label = profileCatalogById.get(nextLock)?.label || nextLock;
+      $("#runMsg").textContent = `已检测并锁定：${label}`;
+    }
+  }
   appendSubtitles(res.segments);
   return res;
 }
@@ -893,6 +923,14 @@ async function startProcess() {
     filling: false,
     consecFails: 0,
   });
+  // 新一轮识别：只清自动检测锁定，用户选择的预设与口音保持不变
+  const rec = resetRecognitionSession(
+    $("#recognitionProfile")?.value || "auto",
+    $("#accentVariant")?.value || "auto"
+  );
+  stream.selectedProfileId = rec.selectedProfileId;
+  stream.lockedProfileId = rec.lockedProfileId;
+  stream.accentVariant = rec.accentVariant;
 
   // 高精度模式：先用 demucs 分离人声，ASR 改用纯人声轨（播放仍用原视频）
   if ($("#hiQuality").checked) {
@@ -1630,6 +1668,7 @@ async function openProjectDialog() {
     stream.holes = [];
     stream.filling = false;
     stream.consecFails = 0;
+    stream.lockedProfileId = null; // 打开的项目是全新会话：只清自动锁定
     state.videoPath = "";
     state.subtitles = [];
     resetUndo(); // 打开的项目是全新会话，旧撤销历史不得混入

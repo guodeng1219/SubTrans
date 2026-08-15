@@ -21,6 +21,39 @@ export function lockDetectedProfile(selectedProfileId, lockedProfileId, detected
 }
 
 /**
+ * 会话重置（纯函数）：新视频 / 重新识别 / 打开项目时重建识别会话状态。
+ * 只清空自动检测锁定；用户选择的预设与口音保持不变。
+ *
+ * @param {string} selectedProfileId 用户当前选择的预设 ID
+ * @param {string} accentVariant 用户当前选择的口音变体 ID
+ * @returns {{selectedProfileId: string, lockedProfileId: null, accentVariant: string}}
+ */
+export function resetRecognitionSession(selectedProfileId, accentVariant) {
+  return {
+    selectedProfileId: selectedProfileId || "auto",
+    lockedProfileId: null,
+    accentVariant: accentVariant || "auto",
+  };
+}
+
+/**
+ * 会话隔离的锁定决策（纯函数）：过期会话（currentSession !== responseSession）
+ * 的检测结果不能改动当前锁定，返回原锁不变。
+ *
+ * @returns {string|null} 应写入 lockedProfileId 的新值
+ */
+export function applyDetectedProfileForSession(
+  currentSession,
+  responseSession,
+  selectedProfileId,
+  lockedProfileId,
+  detectedProfileId
+) {
+  if (currentSession !== responseSession) return lockedProfileId;
+  return lockDetectedProfile(selectedProfileId, lockedProfileId, detectedProfileId) ?? lockedProfileId;
+}
+
+/**
  * 有界滚动上下文（纯函数）：取最近 maxLines 条非空原文，按换行连接，
  * 再从左侧截断至 maxChars 个 Unicode 字符，保证最新对白存活。
  *
