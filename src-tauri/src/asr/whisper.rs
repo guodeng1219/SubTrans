@@ -23,7 +23,10 @@ impl AsrEngine for WhisperEngine {
         let mut state =
             self.ctx.create_state().map_err(|e| anyhow!("创建 Whisper state 失败: {e:?}"))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: options.best_of });
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: options.beam_size.clamp(1, 10),
+            patience: 1.0,
+        });
         params.set_n_threads(options.threads);
         params.set_translate(false);
         params.set_print_special(false);

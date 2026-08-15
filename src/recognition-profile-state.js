@@ -54,22 +54,70 @@ export function applyDetectedProfileForSession(
 }
 
 /**
- * 有界滚动上下文（纯函数）：取最近 maxLines 条非空原文，按换行连接，
- * 再从左侧截断至 maxChars 个 Unicode 字符，保证最新对白存活。
+ * 有界滚动上下文（纯函数）：只取 `end <= beforeSec` 的已确认原文（按 end 升序），
+ * 取最近 maxLines 条非空行，按换行连接，再从左侧截断至 maxChars 个 Unicode 字符，
+ * 保证最新对白存活。补洞/重跑早期片段时不得引用未来对白。
  *
- * @param {Array<{original?: string}>} subtitles 按时间有序的字幕列表
+ * @param {Array<{original?: string, end?: number}>} subtitles 字幕列表
+ * @param {number} beforeSec 当前分片开始时间（只取此时刻之前结束的字幕）
  * @param {number} maxLines 最多取最近几行（默认 3）
  * @param {number} maxChars 总字符上限（默认 600，按码点计数）
  * @returns {string} 合成上下文；无有效原文时为空串
  */
-export function buildRollingContext(subtitles, maxLines = 3, maxChars = 600) {
-  const lines = (Array.isArray(subtitles) ? subtitles : [])
-    .map((s) => (s && typeof s.original === "string" ? s.original.trim() : ""))
-    .filter(Boolean);
-  const recent = lines.slice(-Math.max(1, maxLines));
-  const joined = recent.join("\n");
+export function buildRollingContext(subtitles, beforeSec, maxLines = 3, maxChars = 600) {
+  const rows = (Array.isArray(subtitles) ? subtitles : [])
+    .filter((s) => s && Number.isFinite(Number(s.end)) && Number(s.end) <= beforeSec)
+    .map((s) => ({
+      end: Number(s.end),
+      text: s && typeof s.original === "string" ? s.original.trim() : "",
+    }))
+    .filter((r) => r.text);
+  // 稳定排序：同 end 保持原顺序；再取最近 maxLines 条
+  rows.sort((a, b) => a.end - b.end);
+  const joined = rows
+    .slice(-Math.max(1, maxLines))
+    .map((r) => r.text)
+    .join("\n");
   // 按 Unicode 码点从左侧截断：旧对白先被丢弃，最新对白存活
   return [...joined].slice(-Math.max(0, maxChars)).join("");
+}
+
+/**
+ * 目录加载完成后的归一化（纯函数）：请求的预设可用则原样保留；
+ * 不可用则回退 custom（sourceLang 非空）或 auto（sourceLang 为空），
+ * 并始终保留 sourceLang；不可用的口音重置为 auto。
+ *
+ * @param {object} settings 已迁移的识别设置
+ * @param {Set<string>} availableProfileIds 已加载的预设 ID 集合
+ */
+export function normalizeRecognitionSettingsForCatalog(settings, availableProfileIds) {
+  const rec = migrateRecognitionSettings(settings);
+  const ids =
+    availableProfileIds instanceof Set
+      ? availableProfileIds
+      : new Set(Array.isArray(availableProfileIds) ? availableProfileIds : []);
+  if (ids.has(rec.recognitionProfileId)) {
+    return rec;
+  }
+  return {
+    recognitionProfileId: rec.sourceLang ? "custom" : "auto",
+    accentVariant: "auto",
+    sourceLang: rec.sourceLang,
+  };
+}
+
+/**
+ * 等目录 Promise 就绪后再归一化识别设置（纯异步函数）：
+ * 修复「异步加载目录 vs 同步恢复项目」的竞态——en-film 等选项尚未生成时，
+ * 保存的预设不得静默塌缩丢失。
+ *
+ * @param {object} settings 项目 settings
+ * @param {Promise<Set<string>>} profilesReady 目录 ID 集合的 Promise
+ * @returns {Promise<{recognitionProfileId: string, accentVariant: string, sourceLang: string}>}
+ */
+export async function resolveRecognitionSettingsAfterCatalog(settings, profilesReady) {
+  const available = await profilesReady;
+  return normalizeRecognitionSettingsForCatalog(settings, available);
 }
 
 const V1_SOURCE_TO_PROFILE = {

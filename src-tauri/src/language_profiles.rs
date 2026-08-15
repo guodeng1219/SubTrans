@@ -28,7 +28,6 @@ struct LanguageProfile {
     language: Option<&'static str>,
     initial_prompt: &'static str,
     beam_size: u8,
-    best_of: u8,
     rolling_context_lines: u8,
     accent_variants: &'static [AccentVariant],
 }
@@ -57,7 +56,6 @@ pub struct ResolvedLanguageProfile {
     /// 已包含口音后缀、尚未包含滚动上下文与热词的提示词（由 [`compose_initial_prompt`] 合成）。
     pub initial_prompt: String,
     pub beam_size: usize,
-    pub best_of: i32,
     pub rolling_context_lines: usize,
     /// 降级等非致命提示（如口音变体不适用）。
     pub warning: Option<String>,
@@ -81,7 +79,7 @@ const ACCENT_EN_US: AccentVariant = AccentVariant {
 const EN_ACCENTS: &[AccentVariant] = &[ACCENT_AUTO, ACCENT_EN_GB, ACCENT_EN_US];
 const AUTO_ONLY: &[AccentVariant] = &[ACCENT_AUTO];
 
-/// 首批预设目录。所有内置影视预设使用 beam_size=5、best_of=5、滚动上下文 3 行；
+/// 首批预设目录。所有内置影视预设使用 beam_size=5、滚动上下文 3 行；
 /// 预设只改善提示词与上下文，不替换底层 Whisper 模型。
 static PROFILES: &[LanguageProfile] = &[
     LanguageProfile {
@@ -90,7 +88,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: None,
         initial_prompt: "",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -100,7 +97,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: Some("zh"),
         initial_prompt: "以下是影视对白，使用简体中文。人名、地名和术语应保持一致。",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -110,7 +106,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: Some("en"),
         initial_prompt: "This is film dialogue in English. Preserve character names, place names, contractions, and natural speech.",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: EN_ACCENTS,
     },
@@ -120,7 +115,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: Some("ja"),
         initial_prompt: "これは日本語の映像作品の会話です。人名、地名、敬称を正確に書き起こしてください。",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -130,7 +124,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: Some("ko"),
         initial_prompt: "한국어 영상 대화입니다. 인명, 지명, 존댓말 어미를 정확히 기록합니다.",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -140,7 +133,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: Some("fr"),
         initial_prompt: "Dialogue de film en français. Conserver les noms propres, les élisions, les apostrophes et les accents.",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -150,7 +142,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: Some("de"),
         initial_prompt: "Deutschsprachiger Filmdialog. Eigennamen, zusammengesetzte Wörter und Großschreibung beibehalten.",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -160,7 +151,6 @@ static PROFILES: &[LanguageProfile] = &[
         language: None,
         initial_prompt: "",
         beam_size: 5,
-        best_of: 5,
         rolling_context_lines: 3,
         accent_variants: AUTO_ONLY,
     },
@@ -248,7 +238,6 @@ pub fn resolve_profile(
         language,
         initial_prompt: base,
         beam_size: profile.beam_size as usize,
-        best_of: profile.best_of as i32,
         rolling_context_lines: profile.rolling_context_lines as usize,
         warning,
     })

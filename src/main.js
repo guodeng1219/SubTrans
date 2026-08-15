@@ -5,7 +5,9 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   lockDetectedProfile,
   buildRollingContext,
-  migrateRecognitionSettings,
+  resetRecognitionSession,
+  applyDetectedProfileForSession,
+  resolveRecognitionSettingsAfterCatalog,
 } from "./recognition-profile-state.js";
 import { formatVocalProgress } from "./vocal-progress.js";
 
@@ -47,6 +49,9 @@ const stream = {
 
 // ───────── 识别预设目录（后端唯一真相源，前端只读展示元数据） ─────────
 let profileCatalogById = new Map(); // id → LanguageProfileDto
+// 目录加载 Promise（Set<profileId>）：项目恢复必须等待它，避免 en-film 等选项
+// 尚未生成时保存的预设静默塌缩；失败时回退静态 auto/custom 集合。
+let profilesReady = Promise.resolve(new Set(["auto", "custom"]));
 
 // 按所选预设刷新口音/自定义语言组的可见性与选项（保留合法选择，非法回退 auto）
 function updateRecognitionGroups() {
@@ -75,11 +80,14 @@ function updateRecognitionGroups() {
   $("#customLanguageGroup")?.classList.toggle("hidden", profileId !== "custom");
 }
 
-// 从后端加载预设目录；失败保留 HTML 里的静态 auto/custom 兜底项
+// 从后端加载预设目录；返回可用 ID 集合，失败回退静态 auto/custom（Promise 永不 reject，
+// 项目加载不会因目录失败而挂起）
 async function loadRecognitionProfiles() {
   try {
     const profiles = await invoke("list_language_profiles");
-    if (!Array.isArray(profiles) || !profiles.length) return;
+    if (!Array.isArray(profiles) || !profiles.length) {
+      return new Set(["auto", "custom"]);
+    }
     profileCatalogById = new Map(profiles.map((p) => [p.id, p]));
     const sel = $("#recognitionProfile");
     const current = sel.value;
@@ -93,10 +101,12 @@ async function loadRecognitionProfiles() {
     // 保留当前选择（若仍有效）；否则回退 auto
     sel.value = [...sel.options].some((o) => o.value === current) ? current : "auto";
     updateRecognitionGroups();
+    return new Set(profiles.map((p) => p.id));
   } catch (err) {
     console.error("[subtrans] list_language_profiles failed:", err);
     // 目录不可用时保留静态 auto/custom 兜底项，用户仍可按旧方式选源语言
     updateRecognitionGroups();
+    return new Set(["auto", "custom"]);
   }
 }
 
@@ -384,8 +394,9 @@ function initApp() {
 
   // 识别预设切换 → 刷新口音/自定义语言组的可见性与选项
   $("#recognitionProfile").addEventListener("change", updateRecognitionGroups);
-  // 加载后端预设目录（不阻塞启动：失败保留静态 auto/custom 兜底项）
-  loadRecognitionProfiles();
+  // 加载后端预设目录（不阻塞启动：失败保留静态 auto/custom 兜底项）；
+  // profilesReady 被 applyProject 等待，保证项目恢复与目录加载的顺序
+  profilesReady = loadRecognitionProfiles();
 
   // 模型切换 → 更新预估时间
   $("#whisperModel").addEventListener("change", updateEstimate);
@@ -696,7 +707,9 @@ async function invokeChunk(start, dur) {
   const selected = $("#recognitionProfile")?.value || "auto";
   const effectiveProfileId = stream.lockedProfileId || selected;
   const accentVariant = $("#accentVariant")?.value || "auto";
-  const contextPrompt = buildRollingContext(state.subtitles, 3, 600);
+  // 时间过滤的滚动上下文：只取 end <= 当前分片 start 的已确认原文，
+  // 补洞/seek 重定位/重跑早期片段都不会把未来对白喂给模型
+  const contextPrompt = buildRollingContext(state.subtitles, start, 3, 600);
   const res = await invoke("process_chunk", {
     videoPath: state.videoPath,
     audioSource: stream.audioSource,
@@ -1547,7 +1560,7 @@ function collectProject(includeSecret = false) {
   };
 }
 
-function applyProject(p) {
+async function applyProject(p) {
   if (!p || typeof p !== "object") return false;
   // 字幕（对损坏字段做兜底，不让一个坏条目毁掉整个项目）
   if (Array.isArray(p.subtitles)) {
@@ -1574,8 +1587,9 @@ function applyProject(p) {
     if (el && v != null) el.checked = !!v;
   };
   setVal("#whisperModel", s.modelName);
-  // v1 → v2 识别设置迁移（映射 sourceLang；不常见语言保留为 custom）
-  const rec = migrateRecognitionSettings(s);
+  // 识别设置：等待预设目录就绪后迁移 + 归一化（目录缺该预设时保留 sourceLang
+  // 回退 custom/auto，绝不静默丢失保存值）
+  const rec = await resolveRecognitionSettingsAfterCatalog(s, profilesReady);
   setVal("#recognitionProfile", rec.recognitionProfileId);
   setVal("#accentVariant", rec.accentVariant);
   setVal("#sourceLang", rec.sourceLang);
@@ -1646,7 +1660,7 @@ async function saveAutosave() {
 async function restoreAutosave() {
   try {
     const p = await invoke("load_autosave");
-    if (p && applyProject(p)) {
+    if (p && (await applyProject(p))) {
       $("#runMsg").textContent = `已恢复上次会话（${state.subtitles.length} 条字幕）${
         state.videoPath ? "" : "· 原视频已移动，字幕仍保留"
       }`;
@@ -1693,7 +1707,7 @@ async function openProjectDialog() {
     state.subtitles = [];
     resetUndo(); // 打开的项目是全新会话，旧撤销历史不得混入
     state.session++; // 会话令牌：项目可能指向与当前相同的视频，旧分片不得写入新列表
-    if (applyProject(p)) {
+    if (await applyProject(p)) {
       lastSnapshot = snapshotSubs(); // 以载入状态为撤销基准
       goStep(3);
       $("#runMsg").textContent = `项目已打开（${state.subtitles.length} 条字幕）`;

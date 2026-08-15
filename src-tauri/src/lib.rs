@@ -180,6 +180,29 @@ fn apply_glossary(text: &str, map: &[(String, String)]) -> String {
     out
 }
 
+/// 自动检测锁定门槛（纯函数）：
+/// - 非 auto 预设不锁定（手动选择优先）；
+/// - 清理后无非空段（静音/纯音乐）不锁定；
+/// - GPU 有概率字段时要求 `>= 0.70`，非有限概率视为不可信；
+/// - CPU 无概率字段时以「至少一个非空段」作为最低对白证据；
+/// - 检测语言无内置预设（如 es）时返回 None，自动会话保持 auto。
+fn detected_profile_for_chunk(
+    profile_id: &str,
+    detected_lang: Option<&str>,
+    nonempty_segment_count: usize,
+    language_probability: Option<f64>,
+) -> Option<&'static str> {
+    if profile_id != "auto" || nonempty_segment_count == 0 {
+        return None;
+    }
+    if let Some(p) = language_probability {
+        if !p.is_finite() || p < 0.70 {
+            return None;
+        }
+    }
+    language_profiles::profile_for_detected_language(detected_lang)
+}
+
 /// 解析分片识别预设：预设 ID + 口音变体 + 自定义语言，与滚动上下文、已解析的
 /// 源语言热词合成最终提示词。CPU 与 GPU 共用同一结果，保证两条链路对齐。
 /// `source_lang` 仅 `custom` 预设使用；`hotwords` 为 `glossary_hotwords` 的输出。
@@ -937,16 +960,9 @@ async fn process_chunk_inner(
     let src_owned: Option<String> = profile.language.clone();
     let offset = real_start;
 
-    // 术语词典：映射对用于译文强制替换；源词作为 faster-whisper 热词（截断防超长）
+    // 术语词典：映射对用于译文强制替换；源词经 compose_initial_prompt 单通道注入
+    // 识别提示词（GPU 原生 hotwords 留空，避免同一批术语双重偏置）
     let glossary_map = parse_glossary_mapping(&glossary);
-    let hotwords = {
-        let keys = glossary_hotwords(&glossary);
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.chars().take(200).collect::<String>())
-        }
-    };
 
     let mut vad_warn: Option<String> = None;
     let detected_lang: Option<String>; // 延迟初始化：两个 ASR 分支各赋值一次
@@ -963,7 +979,9 @@ async fn process_chunk_inner(
             src_owned.as_deref(),
             audio_source.is_some(),
             vad_enabled,
-            hotwords.as_deref(),
+            // 术语已合成进 initial_prompt（单通道注入）；GPU 原生 hotwords 留空，
+            // 避免同一批术语双重偏置（协议仍保留该字段以兼容旧请求）
+            None,
             (!profile.initial_prompt.is_empty()).then_some(profile.initial_prompt.as_str()),
             profile.beam_size,
         )
@@ -1016,7 +1034,7 @@ async fn process_chunk_inner(
         let lang = src_owned.clone();
         let initial_prompt =
             (!profile.initial_prompt.is_empty()).then(|| profile.initial_prompt.clone());
-        let best_of = profile.best_of;
+        let beam_size = profile.beam_size as i32;
         // options 持有 &str 借用，必须在闭包内用 owned 值构造以满足 spawn_blocking 的 'static 要求
         let transcription = tokio::task::spawn_blocking(move || {
             let options = asr::TranscribeOptions {
@@ -1025,7 +1043,7 @@ async fn process_chunk_inner(
                 threads,
                 time_offset_sec: offset,
                 vad_model_path: vad_str.as_deref(),
-                best_of,
+                beam_size,
             };
             eng.transcribe(&audio, options)
         })
@@ -1053,6 +1071,8 @@ async fn process_chunk_inner(
     }
 
     // 2.5) 可选：LLM 同音字校对（按上下文整批修正后再翻译）
+    // 清理后的非空段数：自动锁定门槛的「对白证据」（在翻译消费 segments 前记录）
+    let cleaned_segment_count = segments.len();
     // 告警聚合成列表：预设降级/VAD 降级/纠错失败/翻译失败都保留，不再互相覆盖
     let mut warns: Vec<String> = Vec::new();
     if let Some(w) = profile.warning {
@@ -1168,13 +1188,16 @@ async fn process_chunk_inner(
     };
     let translate_ms = t_tx.elapsed().as_millis() as u64;
 
-    // 自动模式：把检测语言映射为内置预设 ID（无对应预设则保持 auto，不硬切语言）
-    let detected_profile_id = if profile.id == "auto" {
-        language_profiles::profile_for_detected_language(detected_lang.as_deref())
-            .map(str::to_owned)
-    } else {
-        None
-    };
+    // 自动模式锁定门槛：仅 auto 预设、清理后至少一个非空段（对白证据），
+    // GPU 还要求语言概率 ≥0.70；静音/纯音乐/低置信度分片不锁定，
+    // 由后续分片继续自动检测。
+    let detected_profile_id = detected_profile_for_chunk(
+        &profile.id,
+        detected_lang.as_deref(),
+        cleaned_segment_count,
+        detected_lang_probability,
+    )
+    .map(str::to_owned);
 
     let warn = if warns.is_empty() { None } else { Some(warns.join("；")) };
     Ok(ChunkResult {
@@ -2692,8 +2715,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_glossary, estimate_time, glossary_hotwords, parse_glossary_mapping,
-        resolve_chunk_profile, ProgressEvent, VocalProgressFields,
+        apply_glossary, detected_profile_for_chunk, estimate_time, glossary_hotwords,
+        parse_glossary_mapping, resolve_chunk_profile, ProgressEvent, VocalProgressFields,
     };
 
     #[test]
@@ -2743,6 +2766,19 @@ mod tests {
         assert_eq!(p.language.as_deref(), Some("en"));
         assert!(p.initial_prompt.contains("British English"));
         assert!(p.initial_prompt.contains("Mr Pemberton"));
+    }
+
+    #[test]
+    fn automatic_lock_requires_dialogue_and_sufficient_gpu_probability() {
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 0, Some(0.99)), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(0.69)), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(0.70)), Some("en-film"));
+        // CPU 没有概率字段：非空清理后分片就是最低对白证据。
+        assert_eq!(detected_profile_for_chunk("auto", Some("ja"), 1, None), Some("ja-film"));
+        assert_eq!(detected_profile_for_chunk("en-film", Some("ja"), 1, Some(0.99)), None);
+        // 非有限概率与无内置预设的语言不锁定
+        assert_eq!(detected_profile_for_chunk("auto", Some("en"), 2, Some(f64::NAN)), None);
+        assert_eq!(detected_profile_for_chunk("auto", Some("es"), 2, None), None);
     }
 
     #[test]

@@ -240,8 +240,8 @@ pub struct TranscribeOptions<'a> {
     pub time_offset_sec: f64,
     /// Silero VAD 模型路径（None = 不启用 VAD）。
     pub vad_model_path: Option<&'a str>,
-    /// Greedy 采样候选数。
-    pub best_of: i32,
+    /// Beam search 束宽（与 GPU faster-whisper 对齐，实现内钳到 1..=10）。
+    pub beam_size: i32,
 }
 
 /// ASR 转写的结构化输出：字幕段 + 检测语言。
@@ -403,9 +403,9 @@ mod tests {
             threads: 4,
             time_offset_sec: 10.0,
             vad_model_path: None,
-            best_of: 5,
+            beam_size: 5,
         };
         assert_eq!(options.initial_prompt, Some("British film dialogue"));
-        assert_eq!(options.best_of, 5);
+        assert_eq!(options.beam_size, 5);
     }
 }

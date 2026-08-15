@@ -34,29 +34,33 @@ pub struct VocalState {
 }
 
 impl VocalState {
-    /// 开始新任务：删除上一个会话发布的人声轨，返回新的会话令牌。
+    /// 开始新任务：**先换代再清理**——换代先行使所有在飞 publish 立即失败，
+    /// 随后删除上一个会话发布的人声轨，返回新的会话令牌。
     pub fn begin(&self) -> u64 {
+        let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.delete_published();
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        token
     }
 
-    /// 取消当前任务并删除已发布的人声轨。
+    /// 取消当前任务：同样先换代再删除，杜绝「检查令牌后、加锁前取消」的竞态窗口。
     pub fn cancel(&self) {
-        self.delete_published();
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.delete_published();
     }
 
     pub fn is_cancelled(&self, token: u64) -> bool {
         self.generation.load(Ordering::SeqCst) != token
     }
 
-    /// 发布最终人声轨路径：会话已过期时直接删除文件并报错，防止 GB 级临时 WAV 泄漏。
+    /// 发布最终人声轨路径：令牌检查与替换发布在**同一把锁内**原子完成——
+    /// 若取消恰好在两者之间发生，过期人声轨被直接删除并报错，绝不进入已发布状态。
     pub fn publish_output(&self, token: u64, path: PathBuf) -> Result<(), String> {
-        if self.is_cancelled(token) {
+        let mut guard = self.published_output.lock().unwrap();
+        if self.generation.load(Ordering::SeqCst) != token {
+            drop(guard);
             let _ = std::fs::remove_file(&path);
             return Err("vocal_cancelled".into());
         }
-        let mut guard = self.published_output.lock().unwrap();
         if let Some(old) = guard.take() {
             let _ = std::fs::remove_file(&old);
         }
@@ -245,7 +249,8 @@ fn emit_chunk_progress(
     total: usize,
     completed_frames: u64,
     total_frames: u64,
-    ctx: &WorkerCtx,
+    peak_private_bytes: u64,
+    budget_bytes: u64,
     retrying: bool,
     warning: bool,
 ) {
@@ -258,9 +263,9 @@ fn emit_chunk_progress(
         VocalProgressFields {
             chunk_index: done,
             chunk_total: total,
-            memory_bytes: ctx.memory_guard.peak_private_bytes(),
-            memory_peak_bytes: ctx.memory_guard.peak_private_bytes(),
-            memory_budget_bytes: ctx.budget,
+            memory_bytes: peak_private_bytes,
+            memory_peak_bytes: peak_private_bytes,
+            memory_budget_bytes: budget_bytes,
             retrying_with_smaller_chunks: retrying,
             warning,
         },
@@ -317,7 +322,10 @@ async fn process_one_chunk(
     std::fs::rename(&input_part, &input_wav)
         .map_err(|e| VocalPipelineError::new("vocal_chunk_extract_failed", e.to_string()))?;
 
-    // 2) 送 worker 分离，等待期间采样内存 / 响应取消
+    // 2) 送 worker 分离，等待期间采样内存 / 响应取消。
+    // 关键：read_response future 只创建并 pin 一次——它内部的 30 分钟单片超时
+    // 从创建时刻起算，select! 循环迭代不能重建它（否则每次取消轮询都会重置超时，
+    // 卡死的分离只能等整体 2 小时兜底）。
     let output_dir = separated_dir.join(format!("output_{global_index:04}"));
     let request_id = format!("sep-{global_index:04}");
     ctx.worker
@@ -325,47 +333,64 @@ async fn process_one_chunk(
         .await
         .map_err(|e| VocalPipelineError::new("vocal_worker_exited", e))?;
 
-    let resp = loop {
-        tokio::select! {
-            r = ctx.worker.read_response(&request_id) => {
-                break Some(r);
-            }
-            _ = tokio::time::sleep(MEMORY_TICK) => {
-                match ctx.probe.sample() {
-                    Ok(sample) => {
-                        match ctx.memory_guard.observe(sample) {
-                            MemoryDecision::Warn => {
-                                let _ = logger.write(
-                                    "memory_warn",
-                                    &serde_json::json!({
-                                        "budget_bytes": ctx.budget,
-                                        "working_set_bytes": sample.working_set_bytes,
-                                        "private_bytes": sample.private_bytes,
-                                    }),
-                                );
-                                emit_chunk_progress(app, global_index, chunk_total, 0, 0, ctx, false, true);
+    let resp = {
+        let resp_future = ctx.worker.read_response(&request_id);
+        tokio::pin!(resp_future);
+        let result = loop {
+            tokio::select! {
+                r = &mut resp_future => {
+                    break Some(r);
+                }
+                _ = tokio::time::sleep(MEMORY_TICK) => {
+                    match ctx.probe.sample() {
+                        Ok(sample) => {
+                            match ctx.memory_guard.observe(sample) {
+                                MemoryDecision::Warn => {
+                                    let _ = logger.write(
+                                        "memory_warn",
+                                        &serde_json::json!({
+                                            "budget_bytes": ctx.budget,
+                                            "working_set_bytes": sample.working_set_bytes,
+                                            "private_bytes": sample.private_bytes,
+                                        }),
+                                    );
+                                    emit_chunk_progress(
+                                        app,
+                                        global_index,
+                                        chunk_total,
+                                        0,
+                                        0,
+                                        ctx.memory_guard.peak_private_bytes(),
+                                        ctx.budget,
+                                        false,
+                                        true,
+                                    );
+                                }
+                                MemoryDecision::Exceeded => {
+                                    let _ = logger.write("memory_exceeded", &serde_json::json!({"budget_bytes": ctx.budget}));
+                                    // Job 整树终止（含 worker 根进程；resp_future 仍借用 ctx.worker，不能在此 kill）
+                                    ctx.job.terminate(1);
+                                    return Ok(ChunkOutcome::MemoryLimit);
+                                }
+                                MemoryDecision::Continue => {}
                             }
-                            MemoryDecision::Exceeded => {
-                                let _ = logger.write("memory_exceeded", &serde_json::json!({"budget_bytes": ctx.budget}));
-                                ctx.job.terminate(1); // Job 整树终止（KILL_ON_JOB_CLOSE 兜底）
-                                ctx.worker.kill().await;
-                                return Ok(ChunkOutcome::MemoryLimit);
-                            }
-                            MemoryDecision::Continue => {}
+                        }
+                        Err(_) => {
+                            // root 消失 → read_response 会以 worker_exited 收场，交给下一次 select 分支
                         }
                     }
-                    Err(_) => {
-                        // root 消失 → read_response 会以 worker_exited 收场，交给下一次 select 分支
+                }
+                _ = tokio::time::sleep(CANCEL_TICK) => {
+                    if state.is_cancelled(token) {
+                        // 同上：整树终止，避免与 resp_future 的 &mut ctx.worker 借用冲突
+                        ctx.job.terminate(1);
+                        return Err(VocalPipelineError::new("vocal_cancelled", "任务已取消"));
                     }
                 }
             }
-            _ = tokio::time::sleep(CANCEL_TICK) => {
-                if state.is_cancelled(token) {
-                    ctx.worker.kill().await;
-                    return Err(VocalPipelineError::new("vocal_cancelled", "任务已取消"));
-                }
-            }
-        }
+        };
+        // 内层作用域结束：future 本体随作用域销毁，&mut ctx.worker 借用随之释放
+        result
     };
 
     // 3) 响应分类
@@ -539,7 +564,8 @@ pub async fn run_bounded_vocal_pipeline(
                         plan.chunks.len(),
                         attempt.completed_until_frame,
                         source_info.frames,
-                        &ctx,
+                        ctx.memory_guard.peak_private_bytes(),
+                        ctx.budget,
                         retried,
                         false,
                     );
