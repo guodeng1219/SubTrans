@@ -4,7 +4,7 @@
 //! 超时丢弃 future 时子进程会被立刻杀死，不会留下孤儿进程或半成品文件。
 
 use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
@@ -564,7 +564,7 @@ pub fn read_wav_as_f32(wav_path: &Path) -> Result<Vec<f32>> {
 mod tests {
     use super::*;
 
-    fn test_wav_path(label: &str) -> PathBuf {
+    fn test_wav_path(label: &str) -> std::path::PathBuf {
         let stamp =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("subtrans-{label}-{}-{stamp}.wav", std::process::id()))

@@ -131,7 +131,8 @@ impl ProcessMemoryProbe {
             return Err("worker 进程已消失".into());
         }
         let working_set_bytes = rows.iter().map(|r| r.working_set_bytes).sum();
-        let private_bytes = rows.iter().map(|r| r.private_bytes).sum();
+        // 用树求和辅助函数（生产消费方，避免其成为测试专用死代码）
+        let private_bytes = sum_process_tree_bytes(self.root_pid, &rows);
         Ok(MemorySnapshot { working_set_bytes, private_bytes, available_system_bytes: available })
     }
 
@@ -236,6 +237,13 @@ impl MemoryGuard {
 pub struct JobGuard {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
+
+// HANDLE 是 *mut c_void（原始指针默认 !Send/!Sync）。JobGuard 仅被创建它的任务
+// 持有与销毁，跨 await 存活需要 Send 才能让 Tauri 命令 future 可迁移。
+#[cfg(target_os = "windows")]
+unsafe impl Send for JobGuard {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for JobGuard {}
 
 #[cfg(target_os = "windows")]
 impl JobGuard {

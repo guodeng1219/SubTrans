@@ -12,6 +12,7 @@ mod subtitle_parse;
 mod task_log;
 mod translate;
 mod vocal_chunk;
+mod vocal_pipeline;
 mod vocal_worker;
 
 use fw_ipc::FwState;
@@ -1551,8 +1552,6 @@ async fn separate_vocals_inner(
 ) -> Result<String, String> {
     let python_exe = if python_exe.is_empty() { resolve_python(&app) } else { python_exe };
     check_python_path(&python_exe)?;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::Command as TokioCommand;
     // 每次分离用独立目录（带 PID + 时间戳），避免多实例/并发互相删目录；
     // 结束后把 vocals 复制到稳定路径，再清掉工作目录。
     let stamp = std::time::SystemTime::now()
@@ -1581,29 +1580,11 @@ async fn separate_vocals_inner(
     // 工作目录含整段视频的音频（可达 GB 级），由守护对象统一清理：
     // 提取失败 / 分离失败 / 超时 / 成功等所有路径都不在 temp 里堆积大文件。
     let _work_guard = TempDirGuard(work.clone());
-    let audio = work.join("audio.wav");
     let vocals_dest =
         std::env::temp_dir().join(format!("subtrans_vocals_{}_{}.wav", std::process::id(), stamp));
 
-    // 1) 提取整段音频（44.1k 立体声）——异步子进程 + kill_on_drop，超时即杀
-    emit_progress(&app, "separate", 3.0, "提取音频中...");
     let ffmpeg_bin = resolve_ffmpeg(&app);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10 * 60),
-        ffmpeg::extract_audio_full(&video_path, &audio, &ffmpeg_bin),
-    )
-    .await
-    .map_err(|_| "提取整段音频超时（10 分钟），请检查视频文件".to_string())?
-    .map_err(|e| e.to_string())?;
 
-    // 2) 检测用哪个分离引擎：demucs 系模型名走 demucs；
-    //    空模型（默认 BS-RoFormer）或其它 ckpt 走 audio-separator，
-    //    audio-separator 不可用时才回退 demucs 默认模型。
-    let is_demucs_model = model.starts_with("htdemucs") || model.starts_with("mdx_extra");
-    let use_audio_separator = check_audio_separator(&python_exe).await && !is_demucs_model;
-
-    let out_dir = work.join("out");
-    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     // audio-separator 默认把模型下到 /tmp/audio-separator-models（Windows 上会落到
     // C:\tmp，可能无权限且每次重下）；改放到应用数据目录，跨次运行可复用。
     let sep_models_dir = app
@@ -1613,66 +1594,138 @@ async fn separate_vocals_inner(
         .unwrap_or_else(|_| std::env::temp_dir().join("audio-separator-models"));
     std::fs::create_dir_all(&sep_models_dir).map_err(|e| e.to_string())?;
 
-    let mut command = TokioCommand::new(&python_exe);
-    // demucs 回退时要求模型名非空：空模型名（BS-RoFormer 意图）在没有 audio-separator
-    // 时回退到 demucs 默认 htdemucs，避免 `demucs -n ""` 启动即失败。
-    let demucs_model = if model.is_empty() { "htdemucs".to_string() } else { model.clone() };
-    if use_audio_separator {
-        // audio-separator + BS-RoFormer：分离质量显著优于 demucs
-        emit_progress(&app, "separate", 8.0, "分离人声中（BS-RoFormer，首次会下载模型）...");
-        let sep_model = if model.is_empty() {
-            // 未指定模型 → 用默认 BS-RoFormer（demucs 系模型名已在上面的 is_demucs_model 分流走 demucs）
-            "model_bs_roformer_ep_317_sdr_12.9755.ckpt".to_string()
-        } else {
-            model.clone()
-        };
-        // bundle 里 audio_separator 没有 dist-info，CLI 入口（console script / -m）都会挂；
-        // 直接用 Separator API 直调，不依赖命令行解析和包元数据。
-        // 路径一律经 argv（sys.argv[1..]）传入，绝不拼接进 Python 源码：
-        // 路径含单引号（如 O'Neil.mp4 / D:\Users\D'Artagnan\...）时拼接会直接语法错误。
-        let script = concat!(
-            "import sys\n",
-            "from audio_separator.separator import Separator\n",
-            "sep = Separator(model_file_dir=sys.argv[1], output_dir=sys.argv[2], output_format='WAV')\n",
-            "sep.load_model(model_filename=sys.argv[3])\n",
-            "files = sep.separate([sys.argv[4]])\n",
-            "print('OK', files)",
-        );
-        command
-            .arg("-c")
-            .arg(script)
-            .arg(&sep_models_dir)
-            .arg(&out_dir)
-            .arg(&sep_model)
-            .arg(&audio);
-        if device == "cpu" {
-            // audio-separator CLI 没有 --cpu 参数（argparse 会直接报错）；
-            // 用 CUDA_VISIBLE_DEVICES 清空让 torch.cuda.is_available() 为 false，
-            // 从而强制走 CPU，与 demucs 的 -d cpu 行为对齐。
-            command.env("CUDA_VISIBLE_DEVICES", "");
-        }
-    } else {
-        // 回退 demucs
-        emit_progress(
+    let is_demucs_model = model.starts_with("htdemucs") || model.starts_with("mdx_extra");
+    if is_demucs_model {
+        // 明确选择 demucs 模型：保留整片分离路径，行为不变
+        let demucs_model = if model.is_empty() { "htdemucs".to_string() } else { model.clone() };
+        return separate_demucs(
             &app,
-            "separate",
-            8.0,
-            &format!("分离人声中（demucs {demucs_model}, {device}）..."),
-        );
-        command.args([
-            "-m",
-            "demucs",
-            "--two-stems",
-            "vocals",
-            "-n",
+            &video_path,
+            &python_exe,
             &demucs_model,
-            "-d",
             &device,
-            "-o",
-            out_dir.to_str().ok_or("输出路径无效")?,
-            audio.to_str().ok_or("音频路径无效")?,
-        ]);
+            &work,
+            &vocals_dest,
+            &ffmpeg_bin,
+        )
+        .await;
     }
+
+    // ── BS-RoFormer：有界分片管线（默认模型或显式 ckpt） ──
+    // 组件缺失时报明确错误，绝不静默回退到 demucs 或整片分离
+    if !check_audio_separator(&python_exe).await {
+        return Err(
+            "人声分离组件不可用（audio-separator 未安装）：请到「引擎」页安装 GPU 加速组件。\
+             本模式不会自动回退到 demucs 或普通识别。"
+                .into(),
+        );
+    }
+    let sep_model = if model.is_empty() {
+        "model_bs_roformer_ep_317_sdr_12.9755.ckpt".to_string()
+    } else {
+        model.clone()
+    };
+
+    let vocal_state = app.state::<vocal_pipeline::VocalState>();
+    let token = vocal_state.begin();
+    let logger = task_log::TaskLogger::new(data_dir(&app), task_log::new_task_id(token));
+    let _ = logger.write(
+        "task_started",
+        &serde_json::json!({
+            "video": &video_path,
+            "model": &sep_model,
+            "device": &device,
+        }),
+    );
+    let config = vocal_pipeline::VocalPipelineConfig {
+        video_path: &video_path,
+        python_exe: &python_exe,
+        model: &sep_model,
+        device: &device,
+        ffmpeg_bin: &ffmpeg_bin,
+        model_dir: &sep_models_dir,
+        work_dir: &work,
+        stable_output: &vocals_dest,
+    };
+    // 整体 2 小时兜底：超时则换代取消（清理 worker 与已发布输出）
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2 * 3600),
+        vocal_pipeline::run_bounded_vocal_pipeline(
+            &app,
+            vocal_state.inner(),
+            token,
+            config,
+            &logger,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        vocal_state.cancel();
+        "高精度人声分离整体超时（2 小时），任务已终止（vocal_total_timeout）".to_string()
+    })?
+    .map_err(|e| e.user_message())?;
+    // 结果字段进任务日志（同时保证 VocalPipelineResult 各字段有真实消费方）
+    let _ = logger.write(
+        "pipeline_result",
+        &serde_json::json!({
+            "peak_private_bytes": result.peak_private_bytes,
+            "chunk_count": result.chunk_count,
+            "retried_with_smaller_chunks": result.retried_with_smaller_chunks,
+        }),
+    );
+    emit_progress(&app, "separate", 100.0, "人声分离完成");
+    Ok(result.output_path.to_string_lossy().to_string())
+}
+
+/// demucs 明确选择路径：整片提取 + demucs 分离（保留旧行为，不在本次修复范围）。
+#[allow(clippy::too_many_arguments)] // 与上层命令参数一一对应
+async fn separate_demucs(
+    app: &tauri::AppHandle,
+    video_path: &str,
+    python_exe: &str,
+    demucs_model: &str,
+    device: &str,
+    work: &std::path::Path,
+    vocals_dest: &std::path::Path,
+    ffmpeg_bin: &str,
+) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command as TokioCommand;
+
+    let audio = work.join("audio.wav");
+    // 1) 提取整段音频（44.1k 立体声）——异步子进程 + kill_on_drop，超时即杀
+    emit_progress(app, "separate", 3.0, "提取音频中...");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10 * 60),
+        ffmpeg::extract_audio_full(video_path, &audio, ffmpeg_bin),
+    )
+    .await
+    .map_err(|_| "提取整段音频超时（10 分钟），请检查视频文件".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let out_dir = work.join("out");
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+    emit_progress(
+        app,
+        "separate",
+        8.0,
+        &format!("分离人声中（demucs {demucs_model}, {device}）..."),
+    );
+    let mut command = TokioCommand::new(python_exe);
+    command.args([
+        "-m",
+        "demucs",
+        "--two-stems",
+        "vocals",
+        "-n",
+        demucs_model,
+        "-d",
+        device,
+        "-o",
+        out_dir.to_str().ok_or("输出路径无效")?,
+        audio.to_str().ok_or("音频路径无效")?,
+    ]);
     command
         .env("PYTHONUTF8", "1")
         // demucs 模型从 HuggingFace 下载（adefossez/HTDemucs），
@@ -1685,9 +1738,9 @@ async fn separate_vocals_inner(
     {
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command.spawn().map_err(|e| {
-        format!("启动人声分离失败: {e}（请确认已 pip install audio-separator 或 demucs）")
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("启动 demucs 失败: {e}（请确认已 pip install demucs）"))?;
 
     // 读取 stdout+stderr 实时转发进度
     let tail = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
@@ -1742,26 +1795,14 @@ async fn separate_vocals_inner(
         return Err(format!("人声分离失败（退出码 {:?}）：{detail}", status.code()));
     }
 
-    // 3) 定位人声轨文件
-    let vocals = if use_audio_separator {
-        // audio-separator 输出: {input_name}_(Vocals)_{model}.wav
-        match find_vocals_in_dir(&out_dir) {
-            Some(p) => p,
-            None => {
-                return Err(format!("未找到分离结果（在 {} 中）", out_dir.display()));
-            }
-        }
-    } else {
-        // demucs 输出: out/{model}/audio/vocals.wav
-        let p = out_dir.join(&demucs_model).join("audio").join("vocals.wav");
-        if !p.exists() {
-            return Err(format!("未找到分离结果: {}", p.display()));
-        }
-        p
-    };
+    // 2) 定位人声轨：demucs 输出 out/{model}/audio/vocals.wav
+    let vocals = out_dir.join(demucs_model).join("audio").join("vocals.wav");
+    if !vocals.exists() {
+        return Err(format!("未找到分离结果: {}", vocals.display()));
+    }
     // 复制到工作目录之外的稳定路径，然后清理工作目录（守护对象在函数结束时删除）
-    std::fs::copy(&vocals, &vocals_dest).map_err(|e| format!("保存人声轨失败: {e}"))?;
-    emit_progress(&app, "separate", 100.0, "人声分离完成");
+    std::fs::copy(&vocals, vocals_dest).map_err(|e| format!("保存人声轨失败: {e}"))?;
+    emit_progress(app, "separate", 100.0, "人声分离完成");
     Ok(vocals_dest.to_string_lossy().to_string())
 }
 
@@ -1781,18 +1822,6 @@ async fn check_audio_separator(python_exe: &str) -> bool {
         .await
         .map(|r| r.map(|o| o.status.success()).unwrap_or(false))
         .unwrap_or(false)
-}
-
-/// 在目录里找含 "Vocals" 的 wav/flac 文件（audio-separator 输出命名）。
-fn find_vocals_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.contains("vocals") && (name.ends_with(".wav") || name.ends_with(".flac")) {
-            return Some(entry.path());
-        }
-    }
-    None
 }
 
 // ── 项目保存 / 自动保存 ──
@@ -2583,6 +2612,18 @@ fn migrate_legacy_data_dir(app: &tauri::AppHandle) {
     }
 }
 
+/// 取消正在进行的（或已发布输出的）高精度人声分离任务。
+#[tauri::command]
+fn cancel_vocal_separation(state: tauri::State<'_, vocal_pipeline::VocalState>) {
+    state.cancel();
+}
+
+/// 释放当前会话的人声轨临时 WAV（识别结束后由前端调用）。
+#[tauri::command]
+fn release_vocal_track(state: tauri::State<'_, vocal_pipeline::VocalState>) {
+    state.release_output();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ensure_ffmpeg_on_path();
@@ -2595,6 +2636,7 @@ pub fn run() {
         })
         .manage(AsrCache::default())
         .manage(FwState::default())
+        .manage(vocal_pipeline::VocalState::default())
         .invoke_handler(tauri::generate_handler![
             list_language_profiles,
             model_exists,
@@ -2623,11 +2665,17 @@ pub fn run() {
             env_status,
             estimate_time,
             upgrade_cuda,
+            cancel_vocal_separation,
+            release_vocal_track,
         ])
         .on_window_event(|window, event| {
             // 窗口关闭时优雅关闭 faster-whisper 服务，释放 GPU 显存
             if let tauri::WindowEvent::Destroyed = event {
                 let app = window.app_handle();
+                // 先取消人声分离任务（杀 Python/FFmpeg、清理已发布的人声轨）
+                if let Some(vocal) = app.try_state::<vocal_pipeline::VocalState>() {
+                    vocal.cancel();
+                }
                 if let Some(fw_state) = app.try_state::<FwState>() {
                     let fw = fw_state.inner().clone();
                     // 在阻塞上下文里无法 await，用 spawn 异步关闭
