@@ -13,6 +13,9 @@ const state = {
   videoPath: "",
   modelName: "large-v3",
   subtitles: [],
+  // 会话令牌：重新打开同一视频 / 重启识别 / 打开指向同一视频的项目时 +1，
+  // 在飞的异步分片据此判过期（仅比较视频路径无法识别这些情况）
+  session: 0,
 };
 
 // 边播边译的流水线状态
@@ -27,6 +30,9 @@ const stream = {
   waiting: false,    // 播放因等字幕而暂停
   smallSlices: false,
   audioSource: null, // 高精度模式：分离出的人声轨路径（ASR 用它，播放仍用原视频）
+  holes: [],         // 被跳过的 [start,end) 区间（seek 重定位 / 分片出错），收尾统一补全
+  filling: false,    // 收尾补洞进行中（防多个收尾块重复补）
+  consecFails: 0,    // 连续分片失败计数（≥3 停止流水线，防止配置错误时空转）
 };
 
 // GPU 升级状态机
@@ -378,13 +384,22 @@ function initApp() {
       $("#runMsg").textContent = "字幕生成中…";
     }
   });
-  // 向后跳转到尚未生成处：把流水线重定位到该分片继续
+  // 向后跳转到尚未生成处：把流水线重定位到该分片继续。
+  // 被跳过的区间记入 stream.holes，流水线收尾时统一回头补全（不再静默丢内容）。
   video.addEventListener("seeking", () => {
     if (!stream.running) return;
     const t = video.currentTime;
     if (t > stream.readyUntil) {
-      stream.readyUntil = Math.floor(t / stream.chunkLen) * stream.chunkLen;
-      stream.done = false;
+      // chunkLen 可能中途由 120 降为 45，readyUntil 不一定是 chunkLen 的倍数，
+      // 用 max 保证游标只前移、不产生负长度区间
+      const newReady = Math.max(stream.readyUntil, Math.floor(t / stream.chunkLen) * stream.chunkLen);
+      if (newReady > stream.readyUntil) {
+        stream.holes.push({ start: stream.readyUntil, end: newReady });
+        const gapStart = stream.readyUntil;
+        stream.readyUntil = newReady;
+        stream.done = false;
+        $("#runMsg").textContent = `已跳转至 ${fmt(newReady)}，${fmt(gapStart)}–${fmt(newReady)} 将在收尾时补全`;
+      }
       pump();
     }
   });
@@ -397,7 +412,10 @@ function initApp() {
       (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)
     );
   };
-  let lastL = 0;
+  // 连续按 L 判定：按键次数与最近一次按键时刻分开存
+  //（曾共用一个 lastL，第一次按键后 lastL 变成计数 1，下一次 now-1 恒 >500ms，永远停在 1x）
+  let lCount = 0;
+  let lastLTime = 0;
   document.addEventListener("keydown", (e) => {
     // Ctrl+Z/Y 撤销重做（输入框内交给原生撤销，不抢占）
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
@@ -461,7 +479,8 @@ function initApp() {
       case "J":
         v.currentTime = Math.max(0, v.currentTime - 10);
         v.playbackRate = 1;
-        lastL = 0;
+        lCount = 0;
+        lastLTime = 0;
         break;
       case "k":
       case "K":
@@ -470,9 +489,10 @@ function initApp() {
       case "l":
       case "L": {
         const now = performance.now();
-        lastL = now - lastL < 500 ? lastL + 1 : 1;
-        if (lastL >= 3) v.playbackRate = 2;
-        else if (lastL === 2) v.playbackRate = 1.5;
+        lCount = now - lastLTime < 500 ? lCount + 1 : 1;
+        lastLTime = now;
+        if (lCount >= 3) v.playbackRate = 2;
+        else if (lCount === 2) v.playbackRate = 1.5;
         else v.currentTime = Math.min(v.duration, v.currentTime + 10);
         break;
       }
@@ -541,7 +561,11 @@ async function openVideo() {
   stream.readyUntil = 0;
   stream.failedChunks = [];
   stream.audioSource = null; // 旧视频的人声轨不能留给新视频
+  stream.holes = [];
+  stream.filling = false;
+  stream.consecFails = 0;
   resetUndo(); // 旧会话字幕快照不得跨视频生效
+  state.session++; // 会话令牌：即使重新打开同一个视频，旧分片也不得写入新列表
   state.videoPath = path;
   state.subtitles = [];
   renderSubList();
@@ -585,10 +609,11 @@ function correctionEngine() {
   return null;
 }
 
-// 调用后端处理一个时间段，把返回的字幕追加进列表，返回后端结果
+// 调用后端处理一个时间段，把返回的字幕追加进列表，返回后端结果。
+// 会话切换后返回 null（调用方据此丢弃结果，不触碰任何流水线状态）。
 async function invokeChunk(start, dur) {
   const ce = $("#correctEnabled").checked ? correctionEngine() : null;
-  const videoAtCall = state.videoPath; // 在飞请求返回时可能已切换视频，丢弃旧结果
+  const sessionAtCall = state.session; // 在飞请求返回时可能已切换会话，丢弃旧结果
   const res = await invoke("process_chunk", {
     videoPath: state.videoPath,
     audioSource: stream.audioSource,
@@ -612,7 +637,8 @@ async function invokeChunk(start, dur) {
     fwPython: $("#pyPython").value.trim(),
     fwDevice: $("#fwDevice").value,
   });
-  if (state.videoPath === videoAtCall) appendSubtitles(res.segments);
+  if (state.session !== sessionAtCall) return null; // 已切换会话：丢弃过期结果
+  appendSubtitles(res.segments);
   return res;
 }
 
@@ -627,12 +653,13 @@ async function processNextChunk() {
   }
   stream.processing = true;
   const t0 = performance.now();
-  const videoAtStart = state.videoPath; // 处理期间可能切换视频，返回后丢弃旧结果
+  const sessionAtStart = state.session; // 会话切换后不回写任何流水线状态
   try {
     const res = await invokeChunk(start, dur);
-    if (state.videoPath !== videoAtStart) return null; // 已切视频：不回写任何流水线状态
+    if (!res || state.session !== sessionAtStart) return null;
     // 处理期间用户可能向前 seek 改大了 readyUntil，不能被旧分片覆盖
     stream.readyUntil = Math.max(stream.readyUntil, start + dur);
+    stream.consecFails = 0; // 成功一片即清零连续失败计数
     updateStatus(res);
     if (stream.waiting) {
       // 之前因等字幕暂停了，现在新片就绪 → 继续播放
@@ -642,19 +669,29 @@ async function processNextChunk() {
     return performance.now() - t0;
   } catch (err) {
     console.error("[subtrans] process_chunk failed:", start, dur, err);
-    if (state.videoPath !== videoAtStart) return null; // 已切视频：错误属于旧会话，不回写
+    if (state.session !== sessionAtStart) return null; // 错误属于旧会话，不回写
     // 跳过出错分片，继续处理后续分片（而非停止整个流水线）
     stream.readyUntil = Math.max(stream.readyUntil, start + dur); // 跳过这一段
     if (!stream.failedChunks) stream.failedChunks = [];
     stream.failedChunks.push({ start, dur, err: String(err) });
-    $("#runMsg").textContent = `分片 ${fmt(start)} 出错（已跳过）: ${err}`;
+    stream.holes.push({ start, end: start + dur }); // 出错的窗口记入洞，收尾时再试一次
+    stream.consecFails = (stream.consecFails || 0) + 1;
+    if (stream.consecFails >= 3) {
+      // 连续失败（如 Python 路径错、ffmpeg 不可用）时不再空转烧时间，收尾补洞还会再试一次
+      stream.done = true;
+      $("#runMsg").textContent = `连续 ${stream.consecFails} 个分片失败，已停止（请检查引擎设置后重试）: ${err}`;
+      return null;
+    }
+    $("#runMsg").textContent = `分片 ${fmt(start)} 出错（已跳过，收尾时重试）: ${err}`;
     if (stream.waiting) {
       stream.waiting = false;
       $("#video").play().catch(() => {});
     }
     return null;
   } finally {
-    stream.processing = false;
+    // 旧会话的 finally 不能把新会话正在进行的 processing 标志清掉，
+    // 否则新流水线会出现两个分片并发处理
+    if (state.session === sessionAtStart) stream.processing = false;
   }
 }
 
@@ -662,8 +699,8 @@ async function processNextChunk() {
 async function pump() {
   if (stream.pumping) return;
   stream.pumping = true;
-  const videoAtPump = state.videoPath; // 归属会话：切换视频后本 pump 静默退出
-  while (stream.running && !stream.done) {
+  const sessionAtPump = state.session; // 归属会话：会话切换后本 pump 静默退出
+  while (stream.running && !stream.done && state.session === sessionAtPump) {
     const ms = await processNextChunk();
     if (ms === null) {
       if (stream.done) break;
@@ -672,10 +709,16 @@ async function pump() {
   }
   stream.pumping = false;
   // openVideo 会把 running 置 false：收尾块只对"真正跑完"的会话生效
-  if (stream.done && stream.running && state.videoPath === videoAtPump) {
+  if (stream.done && stream.running && state.session === sessionAtPump) {
+    if (stream.filling) return; // 另一个收尾块正在补洞，避免重复补
+    stream.filling = true;
+    const fillStats = await fillHoles();
+    stream.filling = false;
+    if (state.session !== sessionAtPump || !stream.running) return; // 补洞期间会话已切换
     const failed = stream.failedChunks || [];
     const failMsg = failed.length ? `（${failed.length} 个分片出错已跳过：${failed.map(f => fmt(f.start)).join(", ")}）` : "";
-    $("#runMsg").textContent = `字幕已全部生成（至 ${fmt(stream.total)}）${failMsg} · 左侧抽屉中双击可编辑`;
+    const fillMsg = fillStats && fillStats.filled ? ` · 收尾已补全 ${fillStats.filled} 个跳过分片` : "";
+    $("#runMsg").textContent = `字幕已全部生成（至 ${fmt(stream.total)}）${fillMsg}${failMsg} · 左侧抽屉中双击可编辑`;
     $("#startBtn").disabled = false;
     $("#exportBtn").disabled = state.subtitles.length === 0;
     stream.failedChunks = [];
@@ -685,6 +728,47 @@ async function pump() {
     // 自动打开字幕抽屉：让用户立刻看到生成的字幕和编辑入口
     if (state.subtitles.length) $("#subsDrawer").classList.remove("hidden");
   }
+}
+
+// 收尾补洞：seek 重定位 / 分片出错跳过的区间（stream.holes）在流水线结束后统一回头补全。
+// 每个洞按 chunkLen 切成窗口，已被现有字幕覆盖的窗口跳过（判定与导出补洞共用
+// windowCovered）。补洞期间 stream.done 保持 true，播放器可正常播放已生成的部分。
+// 返回 { holeCount, filled, failed }；会话切换（invokeChunk 返回 null）时提前返回 null。
+async function fillHoles() {
+  if (!stream.holes.length) return null;
+  // 合并重叠/相邻区间（多次 seek 的洞可能互相覆盖）
+  const merged = [];
+  for (const h of [...stream.holes].sort((a, b) => a.start - b.start)) {
+    const prev = merged[merged.length - 1];
+    if (prev && h.start <= prev.end + 0.1) prev.end = Math.max(prev.end, h.end);
+    else merged.push({ start: h.start, end: h.end });
+  }
+  stream.holes = []; // 一次性取走，重试失败不再入队（避免死循环）
+  const total = stream.total || 0;
+  if (!total) return null;
+  let filled = 0;
+  let failed = 0;
+  for (const h of merged) {
+    const lo = Math.max(0, Math.min(h.start, total));
+    const hi = Math.max(0, Math.min(h.end, total));
+    if (hi - lo <= 0.05) continue;
+    const step = stream.chunkLen || 120;
+    for (let s = lo; s < hi - 0.05; s += step) {
+      const e = Math.min(s + step, hi);
+      if (windowCovered(s, e)) continue; // seek 前后可能已有局部覆盖
+      $("#runMsg").textContent = `补全字幕 ${fmt(s)} / ${fmt(total)}`;
+      try {
+        const res = await invokeChunk(s, e - s);
+        if (!res) return null; // 会话已切换：由调用方检查 session 后静默收尾
+        filled++;
+      } catch (err) {
+        console.error("[subtrans] 补洞分片失败:", s, err);
+        failed++;
+        stream.failedChunks.push({ start: s, dur: e - s, err: String(err) });
+      }
+    }
+  }
+  return { holeCount: merged.length, filled, failed };
 }
 
 function updateStatus(res) {
@@ -707,6 +791,7 @@ function updateStatus(res) {
 
 async function startProcess() {
   if (!state.videoPath) return;
+  state.session++; // 新一轮识别：上一次运行的在飞分片立即过期（同一视频重复点开始同理）
   const video = $("#video");
   if (!video.duration || isNaN(video.duration)) {
     // 等待元数据加载，带超时避免损坏视频导致 UI 卡死
@@ -726,7 +811,7 @@ async function startProcess() {
   $("#exportBtn").disabled = true;
   setFill("#runFill", 0);
 
-  const videoAtProc = state.videoPath; // 会话令牌：中途切视频则本次启动静默放弃
+  const sessionAtProc = state.session; // 本次启动归属的会话：中途切换则静默放弃
   Object.assign(stream, {
     chunkLen: 120,
     readyUntil: 0,
@@ -739,6 +824,9 @@ async function startProcess() {
     smallSlices: false,
     audioSource: null,
     failedChunks: [],
+    holes: [],
+    filling: false,
+    consecFails: 0,
   });
 
   // 高精度模式：先用 demucs 分离人声，ASR 改用纯人声轨（播放仍用原视频）
@@ -765,7 +853,7 @@ async function startProcess() {
   // 先处理头一片，再开播 + 启动后台连续流水线
   $("#runMsg").textContent = `处理第一段（约${Math.round(stream.chunkLen / 60)}分钟）...`;
   const ms = await processNextChunk();
-  if (state.videoPath !== videoAtProc) return; // 处理期间已切换视频：不播放、不起流水线
+  if (state.session !== sessionAtProc) return; // 处理期间已切换会话：不播放、不起流水线
   if (ms !== null && ms > stream.chunkLen * 1000) {
     // 处理耗时超过分片时长（慢于实时）→ 后续改更小分片
     stream.smallSlices = true;
@@ -1378,7 +1466,7 @@ function applyProject(p) {
   setChk("#transEnabled", s.transEnabled);
   setChk("#correctEnabled", s.correctEnabled);
   setChk("#useFw", s.useFw);
-  setChk("#vadEnabled", s.vadEnabled);
+  setChk("#vadFilter", s.vadEnabled); // 真实控件是 #vadFilter（vadEnabled 只是项目 JSON 里的字段名）
   setChk("#hiQuality", s.hiQuality);
   setChk("#showOrig", s.showOrig);
   setChk("#showTrans", s.showTrans);
@@ -1466,9 +1554,13 @@ async function openProjectDialog() {
     stream.processing = false;
     stream.pumping = false;
     stream.audioSource = null;
+    stream.holes = [];
+    stream.filling = false;
+    stream.consecFails = 0;
     state.videoPath = "";
     state.subtitles = [];
     resetUndo(); // 打开的项目是全新会话，旧撤销历史不得混入
+    state.session++; // 会话令牌：项目可能指向与当前相同的视频，旧分片不得写入新列表
     if (applyProject(p)) {
       lastSnapshot = snapshotSubs(); // 以载入状态为撤销基准
       goStep(3);
@@ -1496,9 +1588,9 @@ async function exportSrt() {
       return;
     }
   }
-  if (stream.pumping || stream.processing) {
+  if (stream.pumping || stream.processing || stream.filling) {
     $("#runMsg").textContent = "等待后台字幕生成完成...";
-    if (!(await waitUntil(() => !stream.pumping && !stream.processing, 200, WAIT_TIMEOUT))) {
+    if (!(await waitUntil(() => !stream.pumping && !stream.processing && !stream.filling, 200, WAIT_TIMEOUT))) {
       $("#exportBtn").disabled = false;
       $("#runMsg").textContent = "等待字幕生成超时，请先停止/重试识别";
       return;
@@ -1633,7 +1725,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   const lines = [header];
   for (const s of subs) {
     const text = subLines(s, showOrig)
-      .map((t) => t.replace(/\{/g, "（").replace(/\}/g, "）").replace(/\r/g, ""))
+      .map((t) =>
+        t
+          .replace(/\{/g, "（")
+          .replace(/\}/g, "）")
+          .replace(/\r\n|\r/g, "")
+          .replace(/\n/g, "\\N") // 物理换行必须转成 ASS 软换行 \N，否则一条 Dialogue 被拆成多行
+      )
       .join("\\N");
     if (!text) continue;
     lines.push(`Dialogue: 0,${assTs(s.start)},${assTs(s.end)},Default,,0,0,0,,${text}`);
@@ -1666,8 +1764,8 @@ async function burnSubtitles() {
         return;
       }
     }
-    if (stream.pumping || stream.processing) {
-      if (!(await waitUntil(() => !stream.pumping && !stream.processing, 200, 60 * 60 * 1000))) {
+    if (stream.pumping || stream.processing || stream.filling) {
+      if (!(await waitUntil(() => !stream.pumping && !stream.processing && !stream.filling, 200, 60 * 60 * 1000))) {
         $("#runMsg").textContent = "等待字幕生成超时，已取消烧录";
         return;
       }
