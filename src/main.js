@@ -1678,6 +1678,9 @@ async function restoreAutosave() {
     const sessionAtRestore = state.session;
     const p = await invoke("load_autosave");
     if (!p) return;
+    // 加载完成先校验再动状态：applyProject 会修改视频/字幕/设置，
+    // 若期间已切换会话则整次恢复作废（事后校验无法撤销覆盖）
+    if (state.session !== sessionAtRestore) return;
     const applied = await applyProject(p);
     if (state.session !== sessionAtRestore) return;
     if (applied) {
@@ -2389,7 +2392,7 @@ async function detectEnv() {
     gpuErr.classList.add("hidden");
     $("#pyStatus").textContent = "检测到 CUDA 版 torch，但 faster-whisper/demucs 未安装，请用「安装 GPU 加速组件」补齐。";
     $("#useFw").checked = false;
-    $("#hiQuality").checked = false;
+    if (!hiQualityReady) $("#hiQuality").checked = false;
   } else if (gpuUpgrading) {
     badge.className = "gpu-badge upgrading";
     badgeText.textContent = "GPU 升级中...";
@@ -2397,7 +2400,7 @@ async function detectEnv() {
     gpuUpgBtn.classList.add("hidden");
     gpuErr.classList.add("hidden");
     $("#useFw").checked = false;
-    $("#hiQuality").checked = false;
+    if (!hiQualityReady) $("#hiQuality").checked = false;
   } else if (gpuUpgradeError) {
     badge.className = "gpu-badge";
     badgeText.textContent = "GPU 升级失败";
@@ -2407,7 +2410,7 @@ async function detectEnv() {
     gpuErr.classList.remove("hidden");
     $("#gpuErrorText").textContent = gpuUpgradeError;
     $("#useFw").checked = false;
-    $("#hiQuality").checked = false;
+    if (!hiQualityReady) $("#hiQuality").checked = false;
   } else if (env.has_gpu && !env.cuda_torch_ready) {
     // 有 GPU 但 CUDA torch 未安装 → 显示升级按钮
     badge.className = "gpu-badge";
@@ -2419,7 +2422,8 @@ async function detectEnv() {
       ? "检测到 GPU，可点击「安装 GPU 加速组件」或左上角「安装 GPU 加速」。"
       : "未检测到 Python，请先点「一键安装 Python 环境」。";
     $("#useFw").checked = false;
-    $("#hiQuality").checked = false;
+    // CPU 人声分离入口可见时不要强关：保留自动恢复/用户勾选的高精度设置
+    if (!hiQualityReady) $("#hiQuality").checked = false;
   } else {
     badge.className = "gpu-badge";
     badgeText.textContent = env.python_bundled ? "CPU 模式（内置）" : "CPU 模式";
@@ -2430,7 +2434,8 @@ async function detectEnv() {
       ? "CPU 模式：未检测到 GPU，或 GPU 组件未就绪。"
       : "CPU 模式：需要 Python 环境才能启用 GPU 识别 / 人声分离。";
     $("#useFw").checked = false;
-    $("#hiQuality").checked = false;
+    // 同上：BS-RoFormer 在 CPU 上就绪时保留用户的高精度选择
+    if (!hiQualityReady) $("#hiQuality").checked = false;
   }
 
   // 更新预估时间

@@ -27,39 +27,21 @@ const MEMORY_TICK: Duration = Duration::from_secs(2);
 const CANCEL_TICK: Duration = Duration::from_millis(500);
 
 /// 会话级取消/发布状态：换代使旧任务立即失效，已发布的人声轨由会话生命周期管理。
-/// `generation_watch` 把换代广播给正在等待 worker 就绪的启动阶段，
-/// 使「模型加载期间取消」能即时杀掉旧 Python 进程，而不是等 180 秒超时。
-#[derive(Clone)]
+/// 取消感知统一用「500ms 轮询 + is_cancelled」模式（与 run_cancellable 一致），
+/// 不引入 watch 通道——避免 receiver 生命周期与 tokio 无订阅者丢值等边界。
+#[derive(Default, Clone)]
 pub struct VocalState {
     generation: Arc<AtomicU64>,
-    generation_watch: tokio::sync::watch::Sender<u64>,
     published_output: Arc<Mutex<Option<PathBuf>>>,
 }
 
-impl Default for VocalState {
-    fn default() -> Self {
-        let (tx, _rx) = tokio::sync::watch::channel(0);
-        Self {
-            generation: Arc::new(AtomicU64::new(0)),
-            generation_watch: tx,
-            published_output: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
 impl VocalState {
-    /// 换代/取消通知订阅（当前值 + 之后每次换代都会触发 `changed()`）。
-    pub fn cancel_watch(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.generation_watch.subscribe()
-    }
-
     /// 开始新任务：换代与删除旧发布在**同一锁临界区**内原子完成——
     /// 旧 begin/cancel 不可能在「换代之后、删除之前」被新任务抢占，
     /// 从而绝不会误删新任务刚发布的人声轨。
     pub fn begin(&self) -> u64 {
         let mut guard = self.published_output.lock().unwrap();
         let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.generation_watch.send(token);
         if let Some(p) = guard.take() {
             let _ = std::fs::remove_file(&p);
         }
@@ -69,8 +51,7 @@ impl VocalState {
     /// 取消当前任务：同样在锁内先换代再删除，与发布操作线性化。
     pub fn cancel(&self) {
         let mut guard = self.published_output.lock().unwrap();
-        let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.generation_watch.send(token);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(p) = guard.take() {
             let _ = std::fs::remove_file(&p);
         }
@@ -97,14 +78,13 @@ impl VocalState {
     }
 
     /// 释放已发布的人声轨（识别会话结束后调用）。
-    /// 传入 `expected` 时按路径校验归属：旧会话延迟到达的释放指令
-    /// 只会删除自己发布的那份文件，绝不误删新会话的人声轨。
-    pub fn release_output(&self, expected: Option<&Path>) {
+    /// 按路径校验归属：只有 `expected` 与当前发布路径一致才删除——
+    /// 旧会话延迟到达的释放指令不会误删新会话的人声轨，也不会清空其发布状态。
+    pub fn release_output(&self, expected: &Path) {
         let mut guard = self.published_output.lock().unwrap();
-        let matches = match (&*guard, expected) {
-            (Some(current), Some(exp)) => current == exp,
-            (Some(_), None) => true, // 未传路径的调用（兼容）按无条件释放处理
-            (None, _) => false,
+        let matches = match &*guard {
+            Some(current) => current == expected,
+            None => false,
         };
         if matches {
             if let Some(p) = guard.take() {
@@ -236,7 +216,7 @@ impl WorkerCtx {
         let job = JobGuard::assign(pid, budget)
             .map_err(|e| VocalPipelineError::new("vocal_worker_start_failed", e))?;
         let memory_guard = MemoryGuard::new(budget);
-        let worker = pending.wait_ready(state.cancel_watch(), token).await.map_err(|e| {
+        let worker = pending.wait_ready(state, token).await.map_err(|e| {
             let code = if e.contains("vocal_model_unavailable") {
                 "vocal_model_unavailable"
             } else if e.contains("任务已取消") {
@@ -262,7 +242,7 @@ enum ChunkOutcome {
 
 /// 可取消/可超时的异步操作包装：每 500ms 检查会话取消，超时映射到指定错误码。
 /// 显式 Send 约束：Tauri 命令的 future 必须可跨线程（在 async 运行时上迁移）。
-async fn run_cancellable<T, E, F>(
+pub async fn run_cancellable<T, E, F>(
     state: &VocalState,
     token: u64,
     timeout: Duration,
@@ -781,7 +761,7 @@ mod tests {
         let path = unique_temp_wav("published-vocals");
         std::fs::write(&path, b"temporary vocals").unwrap();
         state.publish_output(token, path.clone()).unwrap();
-        state.release_output(Some(&path));
+        state.release_output(&path);
         assert!(!path.exists());
     }
 
@@ -795,12 +775,24 @@ mod tests {
         // 旧会话延迟到达的释放：路径不匹配 → 不动当前发布的人声轨
         let stale = unique_temp_wav("stale-vocals");
         std::fs::write(&stale, b"stale vocals").unwrap();
-        state.release_output(Some(&stale));
+        state.release_output(&stale);
         assert!(published.exists());
         let _ = std::fs::remove_file(&stale);
         // 归属匹配的释放仍然生效
-        state.release_output(Some(&published));
+        state.release_output(&published);
         assert!(!published.exists());
+    }
+
+    #[test]
+    fn release_with_no_published_output_is_a_noop() {
+        let state = VocalState::default();
+        state.begin();
+        // 从未发布过任何输出：释放不 panic、不产生任何文件操作
+        let stale = unique_temp_wav("never-published");
+        std::fs::write(&stale, b"stale vocals").unwrap();
+        state.release_output(&stale);
+        assert!(stale.exists());
+        let _ = std::fs::remove_file(&stale);
     }
 
     #[test]

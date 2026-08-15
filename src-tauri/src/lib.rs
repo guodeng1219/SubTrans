@@ -1622,11 +1622,38 @@ async fn separate_vocals_inner(
     std::fs::create_dir_all(&sep_models_dir).map_err(|e| e.to_string())?;
 
     let is_demucs_model = model.starts_with("htdemucs") || model.starts_with("mdx_extra");
+
+    // ── 任务令牌先行：在**所有异步预检之前**占用令牌 ──
+    // 慢预检的旧请求不可能在快预检的新请求之后调用 begin() 夺取所有权：
+    // 后续请求的 begin() 会让本 token 过期，本请求预检完必须校验后放弃。
+    // 日志同样从此刻起贯穿全流程（预检失败 / demucs / BS-RoFormer 都有 task_failed 终态）。
+    let vocal_state = app.state::<vocal_pipeline::VocalState>();
+    let token = vocal_state.begin();
+    let logger = task_log::TaskLogger::new(data_dir(&app), task_log::new_task_id(token));
+    let _ = logger.write(
+        "task_started",
+        &serde_json::json!({
+            "video": &video_path,
+            "model": &model,
+            "device": &device,
+        }),
+    );
+
     if is_demucs_model {
-        // 明确选择 demucs 模型：保留整片分离路径，行为不变
+        // 明确选择 demucs 模型：走有界执行（Job 硬限 + 内存采样 + 可取消），
+        // 不再是无保护的两小时整片裸跑
+        if vocal_state.is_cancelled(token) {
+            let _ = logger.write(
+                "task_failed",
+                &serde_json::json!({"code": "vocal_cancelled", "message": "任务已取消"}),
+            );
+            return Err("任务已取消".into());
+        }
         let demucs_model = if model.is_empty() { "htdemucs".to_string() } else { model.clone() };
-        return separate_demucs(
+        let res = separate_demucs(
             &app,
+            vocal_state.inner(),
+            token,
             &video_path,
             &python_exe,
             &demucs_model,
@@ -1636,16 +1663,44 @@ async fn separate_vocals_inner(
             &ffmpeg_bin,
         )
         .await;
+        match &res {
+            Ok(path) => {
+                let _ = logger
+                    .write("task_done", &serde_json::json!({"engine": "demucs", "output": path}));
+            }
+            Err(e) => {
+                let _ = logger.write(
+                    "task_failed",
+                    &serde_json::json!({"code": demucs_error_code(e), "message": e}),
+                );
+            }
+        }
+        return res;
     }
 
     // ── BS-RoFormer：有界分片管线（默认模型或显式 ckpt） ──
     // 组件缺失时报明确错误，绝不静默回退到 demucs 或整片分离
     if !check_audio_separator(&python_exe).await {
+        let _ = logger.write(
+            "task_failed",
+            &serde_json::json!({
+                "code": "vocal_model_unavailable",
+                "message": "audio-separator 预检失败（未安装或不可导入）",
+            }),
+        );
         return Err(
             "人声分离组件不可用（audio-separator 未安装）：请到「引擎」页安装 GPU 加速组件。\
              本模式不会自动回退到 demucs 或普通识别。"
                 .into(),
         );
+    }
+    // 预检（最长 30 秒）之后再校验令牌：期间来了新请求则本任务过期，直接放弃
+    if vocal_state.is_cancelled(token) {
+        let _ = logger.write(
+            "task_failed",
+            &serde_json::json!({"code": "vocal_cancelled", "message": "任务已取消"}),
+        );
+        return Err("任务已取消".into());
     }
     let sep_model = if model.is_empty() {
         "model_bs_roformer_ep_317_sdr_12.9755.ckpt".to_string()
@@ -1653,17 +1708,6 @@ async fn separate_vocals_inner(
         model.clone()
     };
 
-    let vocal_state = app.state::<vocal_pipeline::VocalState>();
-    let token = vocal_state.begin();
-    let logger = task_log::TaskLogger::new(data_dir(&app), task_log::new_task_id(token));
-    let _ = logger.write(
-        "task_started",
-        &serde_json::json!({
-            "video": &video_path,
-            "model": &sep_model,
-            "device": &device,
-        }),
-    );
     let config = vocal_pipeline::VocalPipelineConfig {
         video_path: &video_path,
         python_exe: &python_exe,
@@ -1723,10 +1767,25 @@ async fn separate_vocals_inner(
     Ok(result.output_path.to_string_lossy().to_string())
 }
 
-/// demucs 明确选择路径：整片提取 + demucs 分离（保留旧行为，不在本次修复范围）。
+/// demucs 错误码映射：内存超限/取消给出稳定码，其余归为 demucs 失败。
+fn demucs_error_code(message: &str) -> &'static str {
+    if message.contains("内存超限") {
+        "vocal_memory_limit_exceeded"
+    } else if message.contains("任务已取消") {
+        "vocal_cancelled"
+    } else {
+        "vocal_demucs_failed"
+    }
+}
+
+/// demucs 明确选择路径：整片提取 + demucs 分离。
+/// 与 BS-RoFormer 管线同级防护：任务令牌可取消、Job Object 内存硬限、
+/// 内存采样（超限即杀整树）、2 小时死线——不再是无保护的裸跑。
 #[allow(clippy::too_many_arguments)] // 与上层命令参数一一对应
 async fn separate_demucs(
     app: &tauri::AppHandle,
+    state: &vocal_pipeline::VocalState,
+    token: u64,
     video_path: &str,
     python_exe: &str,
     demucs_model: &str,
@@ -1738,16 +1797,21 @@ async fn separate_demucs(
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command as TokioCommand;
 
+    const MEMORY_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+    const CANCEL_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
     let audio = work.join("audio.wav");
-    // 1) 提取整段音频（44.1k 立体声）——异步子进程 + kill_on_drop，超时即杀
+    // 1) 提取整段音频（44.1k 立体声）——可取消 + 超时即杀
     emit_progress(app, "separate", 3.0, "提取音频中...");
-    tokio::time::timeout(
+    vocal_pipeline::run_cancellable(
+        state,
+        token,
         std::time::Duration::from_secs(10 * 60),
+        "vocal_source_decode_failed",
         ffmpeg::extract_audio_full(video_path, &audio, ffmpeg_bin),
     )
     .await
-    .map_err(|_| "提取整段音频超时（10 分钟），请检查视频文件".to_string())?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("[{}] {}", e.code(), e.user_message()))?;
 
     let out_dir = work.join("out");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
@@ -1787,6 +1851,18 @@ async fn separate_demucs(
     let mut child = command
         .spawn()
         .map_err(|e| format!("启动 demucs 失败: {e}（请确认已 pip install demucs）"))?;
+    // 硬限先于模型加载：spawn 后立即绑 Job，demucs 加载/推理全程受 115% 软预算约束
+    let pid = child.id().ok_or("demucs 进程无 PID")?;
+    let mut probe = crate::process_memory::ProcessMemoryProbe::new(pid);
+    let budget = crate::process_memory::effective_memory_budget_bytes(probe.total_physical_bytes());
+    let job = match crate::process_memory::JobGuard::assign(pid, budget) {
+        Ok(job) => job,
+        Err(e) => {
+            let _ = child.start_kill();
+            return Err(format!("绑定 demucs 内存硬限失败: {e}"));
+        }
+    };
+    let mut memory_guard = crate::process_memory::MemoryGuard::new(budget);
 
     // 读取 stdout+stderr 实时转发进度
     let tail = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
@@ -1821,15 +1897,40 @@ async fn separate_demucs(
         }));
     }
 
-    // 分离可能很慢（长视频 + CPU），给 2 小时兜底超时，避免进程卡死时界面永久等待
-    let status =
-        match tokio::time::timeout(std::time::Duration::from_secs(2 * 3600), child.wait()).await {
-            Ok(s) => s.map_err(|e| e.to_string())?,
-            Err(_) => {
-                let _ = child.kill().await;
-                return Err("人声分离超时（2 小时），已终止进程".to_string());
+    // 分离可能很慢（长视频 + CPU）：2 小时死线 + 2 秒内存采样 + 500ms 取消轮询。
+    // 超限/取消/超时都先终止整棵进程树（Job），绝不留下可叠加内存的孤儿进程。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
+    let wait_future = child.wait();
+    tokio::pin!(wait_future);
+    let status = loop {
+        tokio::select! {
+            r = &mut wait_future => break r,
+            _ = tokio::time::sleep(MEMORY_TICK) => {
+                if let Ok(sample) = probe.sample() {
+                    if memory_guard.observe(sample)
+                        == crate::process_memory::MemoryDecision::Exceeded
+                    {
+                        job.terminate(1);
+                        return Err(
+                            "人声分离内存超限（已终止进程树）：请改用 BS-RoFormer（有界分片）或 GPU"
+                                .to_string(),
+                        );
+                    }
+                }
             }
-        };
+            _ = tokio::time::sleep(CANCEL_TICK) => {
+                if state.is_cancelled(token) {
+                    job.terminate(1);
+                    return Err("任务已取消".to_string());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    job.terminate(1);
+                    return Err("人声分离超时（2 小时），已终止进程".to_string());
+                }
+            }
+        }
+    };
+    let status = status.map_err(|e| e.to_string())?;
     for r in readers {
         let _ = r.await;
     }
@@ -2665,14 +2766,11 @@ fn cancel_vocal_separation(state: tauri::State<'_, vocal_pipeline::VocalState>) 
 }
 
 /// 释放当前会话的人声轨临时 WAV（识别结束后由前端调用）。
-/// `vocal_path` 为该会话持有的人声轨路径：只有与后端当前发布路径一致才删除——
-/// 旧会话延迟到达的释放指令不会误删新会话刚发布的人声轨。
+/// `vocal_path` 为**必填**的会话持有路径：后端只删除与当前发布路径一致的这份文件，
+/// 旧会话延迟到达的释放指令（路径不匹配）是空操作——归属校验封死在命令签名上。
 #[tauri::command]
-fn release_vocal_track(
-    state: tauri::State<'_, vocal_pipeline::VocalState>,
-    vocal_path: Option<String>,
-) {
-    state.release_output(vocal_path.as_deref().map(std::path::Path::new));
+fn release_vocal_track(state: tauri::State<'_, vocal_pipeline::VocalState>, vocal_path: String) {
+    state.release_output(std::path::Path::new(&vocal_path));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
