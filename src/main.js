@@ -2,6 +2,11 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  lockDetectedProfile,
+  buildRollingContext,
+  migrateRecognitionSettings,
+} from "./recognition-profile-state.js";
 
 // ───────── 简易本地配置（仅记一个"是否完成向导"标记） ─────────
 const SETUP_KEY = "subtrans.setupDone";
@@ -34,6 +39,61 @@ const stream = {
   filling: false,    // 收尾补洞进行中（防多个收尾块重复补）
   consecFails: 0,    // 连续分片失败计数（≥3 停止流水线，防止配置错误时空转）
 };
+
+// ───────── 识别预设目录（后端唯一真相源，前端只读展示元数据） ─────────
+let profileCatalogById = new Map(); // id → LanguageProfileDto
+
+// 按所选预设刷新口音/自定义语言组的可见性与选项（保留合法选择，非法回退 auto）
+function updateRecognitionGroups() {
+  const sel = $("#recognitionProfile");
+  const profileId = sel?.value || "auto";
+  const profile = profileCatalogById.get(profileId);
+  const accentGroup = $("#accentVariantGroup");
+  const accentSel = $("#accentVariant");
+  const variants = profile && Array.isArray(profile.accent_variants) ? profile.accent_variants : [];
+  if (variants.length > 1) {
+    const current = accentSel.value;
+    accentSel.innerHTML = "";
+    for (const a of variants) {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = a.label;
+      accentSel.appendChild(opt);
+    }
+    accentSel.value = [...accentSel.options].some((o) => o.value === current) ? current : "auto";
+    accentGroup.classList.remove("hidden");
+  } else {
+    accentSel.value = "auto";
+    accentGroup.classList.add("hidden");
+  }
+  // 自定义语言组：仅 custom 预设显示（保留旧 sourceLang 选择行为）
+  $("#customLanguageGroup")?.classList.toggle("hidden", profileId !== "custom");
+}
+
+// 从后端加载预设目录；失败保留 HTML 里的静态 auto/custom 兜底项
+async function loadRecognitionProfiles() {
+  try {
+    const profiles = await invoke("list_language_profiles");
+    if (!Array.isArray(profiles) || !profiles.length) return;
+    profileCatalogById = new Map(profiles.map((p) => [p.id, p]));
+    const sel = $("#recognitionProfile");
+    const current = sel.value;
+    sel.innerHTML = "";
+    for (const p of profiles) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.label;
+      sel.appendChild(opt);
+    }
+    // 保留当前选择（若仍有效）；否则回退 auto
+    sel.value = [...sel.options].some((o) => o.value === current) ? current : "auto";
+    updateRecognitionGroups();
+  } catch (err) {
+    console.error("[subtrans] list_language_profiles failed:", err);
+    // 目录不可用时保留静态 auto/custom 兜底项，用户仍可按旧方式选源语言
+    updateRecognitionGroups();
+  }
+}
 
 // GPU 升级状态机
 let gpuUpgrading = false;     // 是否正在升级中
@@ -312,6 +372,11 @@ function initApp() {
   // 源语言切换 → 引擎提示
   $("#sourceLang").addEventListener("change", updateEngineHint);
   updateEngineHint();
+
+  // 识别预设切换 → 刷新口音/自定义语言组的可见性与选项
+  $("#recognitionProfile").addEventListener("change", updateRecognitionGroups);
+  // 加载后端预设目录（不阻塞启动：失败保留静态 auto/custom 兜底项）
+  loadRecognitionProfiles();
 
   // 模型切换 → 更新预估时间
   $("#whisperModel").addEventListener("change", updateEstimate);
@@ -1393,12 +1458,15 @@ function seekWaveform(e) {
 // 自动保存草稿不落盘密钥，避免明文泄露
 function collectProject(includeSecret = false) {
   return {
-    version: 1,
+    version: 2,
     videoPath: state.videoPath,
     totalSec: stream.total || $("#video").duration || 0,
     subtitles: state.subtitles,
     settings: {
       modelName: $("#whisperModel").value,
+      // v2 识别设置：预设 + 口音；sourceLang 继续保存供旧版本/自定义语言使用
+      recognitionProfileId: $("#recognitionProfile").value,
+      accentVariant: $("#accentVariant")?.value || "auto",
       sourceLang: $("#sourceLang").value,
       targetLang: $("#targetLang").value,
       engine: $("#engine").value,
@@ -1450,7 +1518,12 @@ function applyProject(p) {
     if (el && v != null) el.checked = !!v;
   };
   setVal("#whisperModel", s.modelName);
-  setVal("#sourceLang", s.sourceLang);
+  // v1 → v2 识别设置迁移（映射 sourceLang；不常见语言保留为 custom）
+  const rec = migrateRecognitionSettings(s);
+  setVal("#recognitionProfile", rec.recognitionProfileId);
+  setVal("#accentVariant", rec.accentVariant);
+  setVal("#sourceLang", rec.sourceLang);
+  updateRecognitionGroups();
   setVal("#targetLang", s.targetLang);
   setVal("#engine", s.engine);
   setVal("#dsKey", s.dsKey);
