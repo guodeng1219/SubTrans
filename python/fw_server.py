@@ -3,7 +3,9 @@
 
 由 Rust 后端启动一次，把模型常驻显存，然后逐行处理请求：
   stdin  : 每行一个 JSON，如 {"audio": "C:/path/chunk.wav", "language": "zh",
-           "hotwords": "张三 李四"}（hotwords 可选：术语表热词，faster-whisper v1.0+ 支持）
+           "hotwords": "张三 李四", "initial_prompt": "...", "beam_size": 5}
+           （hotwords/initial_prompt/beam_size 可选：语言预设新增字段，
+             旧协议不携带时分别回退为空热词、空提示词与 beam_size=5）
            或 {"cmd": "quit"}
   stdout : 每行一个 JSON，如 {"segments": [{"start":..,"end":..,"text":..}, ...]}
            启动就绪时先输出 {"ready": true}；出错输出 {"error": "..."}
@@ -38,7 +40,8 @@ try:
 except Exception:
     pass
 
-from faster_whisper import WhisperModel
+# 注意：faster-whisper 的导入放在 main() 内（模型构造前）——
+# 模块级导入会让"协议单元测试"在未安装 GPU 包的裸 Python 上无法运行。
 
 
 def emit(obj):
@@ -69,15 +72,32 @@ def resolve_model(name, model_root=None):
     return name, False
 
 
-def _transcribe(model, audio, lang, separated, vad_enabled, hotwords_raw):
+def _transcribe(
+    model,
+    audio,
+    lang,
+    separated,
+    vad_enabled,
+    hotwords_raw,
+    initial_prompt="",
+    beam_size=None,
+):
     """调用 faster-whisper 识别一个分片。
 
     hotwords（术语表热词）是 v1.0+ 才有的参数：老版本没有该关键字时自动降级为
     不带热词识别，避免 TypeError 让整个分片失败。
+    initial_prompt/beam_size 是语言预设新增字段：旧协议请求不带它们时，
+    分别回退为空提示词与 beam_size=5。
     """
+    # beam_size 缺失回退 5；非整数/越界一律钳到 1..10（防御脏输入）
+    try:
+        beam = 5 if beam_size is None else max(1, min(10, int(beam_size)))
+    except (TypeError, ValueError):
+        beam = 5
+
     kwargs = dict(
         language=lang,
-        beam_size=5,
+        beam_size=beam,
         # VAD：已分离人声轨必开；未分离音频按用户开关决定（音乐多的视频建议开，
         # 纯唱歌/歌词视频可关，避免 Silero 把歌声当“非语音”切掉）
         vad_filter=separated or vad_enabled,
@@ -85,6 +105,9 @@ def _transcribe(model, audio, lang, separated, vad_enabled, hotwords_raw):
         # 0.4 为项目原值：轻声/带背景音乐的人声也能正常识别
         no_speech_threshold=0.4,
     )
+    # 语言预设提示词：非空才传（旧协议为空串时保持原有行为）
+    if initial_prompt:
+        kwargs["initial_prompt"] = initial_prompt
     # 术语表在 Rust 端是逗号分隔（中英文逗号/顿号/分号混用），统一成空格分隔的提示词
     hotwords = " ".join(w for w in re.split(r"[,，、;；\s]+", hotwords_raw or "") if w)
     if not hotwords:
@@ -106,6 +129,8 @@ def main():
 
     # 本地有就用本地（local_files_only 避免联网 head 调用）；否则按模型名走（镜像）下载
     model_id, is_local = resolve_model(model_name, model_root)
+    from faster_whisper import WhisperModel  # 延迟导入：裸 Python 也能跑协议单元测试
+
     try:
         model = WhisperModel(model_id, device=device, compute_type=compute, local_files_only=is_local)
     except Exception as e:
@@ -134,8 +159,12 @@ def main():
         separated = req.get("separated", False)  # 是否已经过人声分离
         vad_enabled = req.get("vad_enabled", False)  # 未分离音频是否也过滤音乐/静音
         hotwords = req.get("hotwords") or ""  # 术语表热词（Rust 端已截断防超长）
+        initial_prompt = req.get("initial_prompt") or ""  # 语言预设提示词（旧协议缺失 → 空）
+        beam_size = req.get("beam_size")  # 解码束宽（旧协议缺失 → Python 端回退 5）
         try:
-            segments, info = _transcribe(model, audio, lang, separated, vad_enabled, hotwords)
+            segments, info = _transcribe(
+                model, audio, lang, separated, vad_enabled, hotwords, initial_prompt, beam_size
+            )
             out = [
                 {"start": float(s.start), "end": float(s.end), "text": s.text}
                 for s in segments

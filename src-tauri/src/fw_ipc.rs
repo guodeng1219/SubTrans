@@ -170,6 +170,8 @@ fn stderr_diag(tail: &Arc<Mutex<std::collections::VecDeque<String>>>) -> String 
 
 /// 让常驻服务识别一个 wav，返回相对该 wav 的字幕段（时间从 0 起，调用方再加 offset）。
 /// separated: 音频是否已经过人声分离（决定 Python 端是否开 VAD）。
+/// initial_prompt: 语言预设 + 滚动上下文合成的提示词（None 不注入）。
+/// beam_size: 解码束宽，序列化前钳到 1..10。
 pub(crate) struct FwTranscription {
     pub segments: Vec<asr::Segment>,
     /// 模型检测到的语言（自动检测时才有意义，前端用来提示用户是否误判）
@@ -177,6 +179,7 @@ pub(crate) struct FwTranscription {
     pub language_probability: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)] // 参数与 Tauri 命令/预设解析一一对应，保持扁平
 pub async fn fw_transcribe_one(
     state: &FwState,
     audio_path: &str,
@@ -184,18 +187,23 @@ pub async fn fw_transcribe_one(
     separated: bool,
     vad_enabled: bool,
     hotwords: Option<&str>,
+    initial_prompt: Option<&str>,
+    beam_size: usize,
 ) -> Result<FwTranscription, String> {
     use tokio::io::AsyncWriteExt;
 
     let mut guard = state.0.lock().await;
     let srv = guard.as_mut().ok_or("faster-whisper 服务未启动")?;
 
+    let beam_size = beam_size.clamp(1, 10);
     let req = serde_json::json!({
         "audio": audio_path,
         "language": language,
         "separated": separated,
         "vad_enabled": vad_enabled,
         "hotwords": hotwords,
+        "initial_prompt": initial_prompt,
+        "beam_size": beam_size,
     });
     if let Err(e) = srv.stdin.write_all(format!("{req}\n").as_bytes()).await {
         *guard = None;

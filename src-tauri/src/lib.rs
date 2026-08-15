@@ -851,6 +851,8 @@ async fn process_chunk_inner(
             audio_source.is_some(),
             vad_enabled,
             hotwords.as_deref(),
+            None, // Task 4 接入语言预设后填充
+            5,
         )
         .await;
         let detected = transcribe?;
