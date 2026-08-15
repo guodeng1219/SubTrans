@@ -10,6 +10,7 @@ mod python_setup;
 mod subtitle_parse;
 mod translate;
 mod vocal_chunk;
+mod vocal_worker;
 
 use fw_ipc::FwState;
 
