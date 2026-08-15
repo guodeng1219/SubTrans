@@ -12,6 +12,7 @@
 
 ### 🎙️ 识别
 
+- **多语言影视识别预设**：内置六种影视对白预设（中文/English/日本語/한국어/Français/Deutsch）+ 自定义语言；English 含英式/美式口音变体（仅提示词后缀，不做拼写替换）。CPU Whisper 与 GPU faster-whisper 共用同一预设解析（语言/提示词/beam_size），行为对齐。自动检测在首个成功分片后锁定到检测语言对应的内置预设，后续分片不再来回切换；每个后续分片携带最近 3 条原文字幕（≤600 字符）作为有界滚动上下文。项目 schema 升级到 v2（保存 `recognitionProfileId`/`accentVariant`），v1 项目自动迁移（`sourceLang` 映射到对应预设，不常见语言保留为 custom，无数据丢失）
 - **音频降噪三档可选**：afftdn（FFT 谱减）/ anlmdn（非局部均值）/ arnndn（RNN 神经网络，模型自动下载）
 - **修复 VAD 模型**：原 `.onnx` 格式与 whisper.cpp 不兼容且已下线，改用 `ggml-silero-v5.1.2.bin`（CPU 路径 VAD 首次真正可用）
 - 术语表热词真正生效（faster-whisper hotwords，含旧版兼容降级）
