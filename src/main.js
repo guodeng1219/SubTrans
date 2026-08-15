@@ -7,6 +7,7 @@ import {
   buildRollingContext,
   migrateRecognitionSettings,
 } from "./recognition-profile-state.js";
+import { formatVocalProgress } from "./vocal-progress.js";
 
 // ───────── 简易本地配置（仅记一个"是否完成向导"标记） ─────────
 const SETUP_KEY = "subtrans.setupDone";
@@ -155,6 +156,10 @@ listen("progress", (e) => {
     setFill("#pyBarFill", pct);
     const st = $("#pyStatus");
     if (st) st.textContent = message;
+  } else if (stage === "separate" && e.payload.chunk_total != null) {
+    // 高精度人声分离结构化进度：分片 + 内存 + 降片重试（旧 separate 事件无新字段，走通用分支）
+    setFill("#runFill", pct);
+    $("#runMsg").textContent = formatVocalProgress(e.payload);
   } else {
     setFill("#runFill", pct);
     $("#runMsg").textContent = message;
@@ -620,6 +625,8 @@ async function openVideo() {
   // 先提交未完成的行内编辑（对象已脱离数组，直接丢弃）；再落盘当前会话草稿
   commitInlineEdit();
   await saveAutosave();
+  // 取消可能仍在运行的高精度人声分离（杀 Python/FFmpeg、清理临时人声轨）
+  await invoke("cancel_vocal_separation").catch(() => {});
   // 切换视频前停掉旧流水线，避免旧任务继续往新列表里塞字幕
   stream.running = false;
   stream.done = true;
@@ -810,6 +817,11 @@ async function pump() {
     const fillStats = await fillHoles();
     stream.filling = false;
     if (state.session !== sessionAtPump || !stream.running) return; // 补洞期间会话已切换
+    // 识别全部结束：释放高精度模式的临时人声轨（GB 级临时 WAV 由后端会话管理）
+    if (stream.audioSource) {
+      await invoke("release_vocal_track").catch(() => {});
+      stream.audioSource = null;
+    }
     const failed = stream.failedChunks || [];
     const failMsg = failed.length ? `（${failed.length} 个分片出错已跳过：${failed.map(f => fmt(f.start)).join(", ")}）` : "";
     const fillMsg = fillStats && fillStats.filled ? ` · 收尾已补全 ${fillStats.filled} 个跳过分片` : "";
@@ -886,6 +898,8 @@ function updateStatus(res) {
 
 async function startProcess() {
   if (!state.videoPath) return;
+  // 取消上一次会话可能仍在运行的高精度人声分离（新会话重新开始）
+  await invoke("cancel_vocal_separation").catch(() => {});
   state.session++; // 新一轮识别：上一次运行的在飞分片立即过期（同一视频重复点开始同理）
   const video = $("#video");
   if (!video.duration || isNaN(video.duration)) {
@@ -944,12 +958,16 @@ async function startProcess() {
       });
     } catch (err) {
       console.error("[subtrans] separate_vocals failed:", err);
-      // 分离失败不阻塞主流程：本次先按普通模式识别，
-      // 但不取消用户的高精度勾选（保留选择，方便查看错误后调整设置重试）
+      // 高精度分离失败：停止识别（绝不静默回退普通音频或 Demucs）。
+      // 不取消用户的高精度勾选，用户可查看错误、调整设置后重试。
+      stream.running = false;
+      stream.done = true;
       stream.audioSource = null;
-      $("#runMsg").textContent = `人声分离失败（本次已按普通模式识别，请检查设置后重试）: ${err}`;
-      $("#demucsStatus").textContent = "✗ 分离失败: " + err;
+      $("#startBtn").disabled = false;
+      $("#runMsg").textContent = `高精度人声分离失败，识别已停止：${err}`;
+      $("#demucsStatus").textContent = `✗ 分离失败: ${err}`;
       $("#demucsStatus").style.color = "var(--danger)";
+      return;
     }
   }
 
@@ -1657,6 +1675,8 @@ async function openProjectDialog() {
     filters: [{ name: "SubTrans 项目", extensions: ["subtrans", "json"] }],
   });
   if (!path) return;
+  // 取消可能仍在运行的高精度人声分离
+  await invoke("cancel_vocal_separation").catch(() => {});
   try {
     const p = await invoke("open_project_file", { path });
     // 打开项目前停掉旧流水线，避免旧任务往新字幕里塞数据
