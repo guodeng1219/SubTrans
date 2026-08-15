@@ -27,19 +27,39 @@ const MEMORY_TICK: Duration = Duration::from_secs(2);
 const CANCEL_TICK: Duration = Duration::from_millis(500);
 
 /// 会话级取消/发布状态：换代使旧任务立即失效，已发布的人声轨由会话生命周期管理。
-#[derive(Default, Clone)]
+/// `generation_watch` 把换代广播给正在等待 worker 就绪的启动阶段，
+/// 使「模型加载期间取消」能即时杀掉旧 Python 进程，而不是等 180 秒超时。
+#[derive(Clone)]
 pub struct VocalState {
     generation: Arc<AtomicU64>,
+    generation_watch: tokio::sync::watch::Sender<u64>,
     published_output: Arc<Mutex<Option<PathBuf>>>,
 }
 
+impl Default for VocalState {
+    fn default() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(0);
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            generation_watch: tx,
+            published_output: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 impl VocalState {
+    /// 换代/取消通知订阅（当前值 + 之后每次换代都会触发 `changed()`）。
+    pub fn cancel_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.generation_watch.subscribe()
+    }
+
     /// 开始新任务：换代与删除旧发布在**同一锁临界区**内原子完成——
     /// 旧 begin/cancel 不可能在「换代之后、删除之前」被新任务抢占，
     /// 从而绝不会误删新任务刚发布的人声轨。
     pub fn begin(&self) -> u64 {
         let mut guard = self.published_output.lock().unwrap();
         let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.generation_watch.send(token);
         if let Some(p) = guard.take() {
             let _ = std::fs::remove_file(&p);
         }
@@ -49,7 +69,8 @@ impl VocalState {
     /// 取消当前任务：同样在锁内先换代再删除，与发布操作线性化。
     pub fn cancel(&self) {
         let mut guard = self.published_output.lock().unwrap();
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.generation_watch.send(token);
         if let Some(p) = guard.take() {
             let _ = std::fs::remove_file(&p);
         }
@@ -76,14 +97,19 @@ impl VocalState {
     }
 
     /// 释放已发布的人声轨（识别会话结束后调用）。
-    pub fn release_output(&self) {
-        self.delete_published();
-    }
-
-    fn delete_published(&self) {
+    /// 传入 `expected` 时按路径校验归属：旧会话延迟到达的释放指令
+    /// 只会删除自己发布的那份文件，绝不误删新会话的人声轨。
+    pub fn release_output(&self, expected: Option<&Path>) {
         let mut guard = self.published_output.lock().unwrap();
-        if let Some(p) = guard.take() {
-            let _ = std::fs::remove_file(&p);
+        let matches = match (&*guard, expected) {
+            (Some(current), Some(exp)) => current == exp,
+            (Some(_), None) => true, // 未传路径的调用（兼容）按无条件释放处理
+            (None, _) => false,
+        };
+        if matches {
+            if let Some(p) = guard.take() {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
 }
@@ -180,9 +206,15 @@ impl WorkerCtx {
     async fn start(
         config: &VocalPipelineConfig<'_>,
         logger: &TaskLogger,
+        state: &VocalState,
+        token: u64,
     ) -> Result<Self, VocalPipelineError> {
-        // 两阶段启动：spawn 后立即取 PID 绑定 Job 硬限——模型加载阶段（ready 之前）
-        // 同样受 115% 软预算约束，而不是等 ready 之后才设限。
+        if state.is_cancelled(token) {
+            return Err(VocalPipelineError::new("vocal_cancelled", "任务已取消"));
+        }
+        // 启动屏障三阶段：spawn → 取 PID 绑 Job 硬限 → wait_ready 才发 load 指令。
+        // Python 端在收到 load 之前绝不加载模型，因此「模型加载前 Job 已生效」是
+        // 协议保证而非竞态下的侥幸；等待就绪期间取消会立即杀掉旧进程。
         let pending =
             VocalWorker::spawn(config.python_exe, config.model_dir, config.model, config.device)
                 .await
@@ -200,13 +232,15 @@ impl WorkerCtx {
         let mut probe = ProcessMemoryProbe::new(pid);
         let physical = probe.total_physical_bytes();
         let budget = effective_memory_budget_bytes(physical);
-        // 硬限先于就绪握手生效：加载模型时分配失败即触发 Job 内存限
+        // Job 绑定失败：pending 随作用域 Drop（kill_on_drop 杀子进程 + 清理临时脚本）
         let job = JobGuard::assign(pid, budget)
             .map_err(|e| VocalPipelineError::new("vocal_worker_start_failed", e))?;
         let memory_guard = MemoryGuard::new(budget);
-        let worker = pending.wait_ready().await.map_err(|e| {
+        let worker = pending.wait_ready(state.cancel_watch(), token).await.map_err(|e| {
             let code = if e.contains("vocal_model_unavailable") {
                 "vocal_model_unavailable"
+            } else if e.contains("任务已取消") {
+                "vocal_cancelled"
             } else {
                 "vocal_worker_start_failed"
             };
@@ -553,9 +587,12 @@ pub async fn run_bounded_vocal_pipeline(
     let mut peak_private: u64 = 0;
     let mut chunk_count: usize = 0;
     let mut retried = false;
+    // 展示用总分片数：降片重试后 = 已完成的旧片数 + 新计划片数，
+    // 保证「第 N/总」单调递增，绝不出现 42/40 之类倒退。
+    let mut chunk_total_display = plan.chunks.len();
 
     loop {
-        let mut ctx = WorkerCtx::start(&config, logger).await?;
+        let mut ctx = WorkerCtx::start(&config, logger, state, token).await?;
         let mut outcome: Result<ChunkOutcome, VocalPipelineError> = Ok(ChunkOutcome::Done);
         for chunk in &plan.chunks {
             match process_one_chunk(
@@ -565,7 +602,7 @@ pub async fn run_bounded_vocal_pipeline(
                 &source_wav,
                 chunk,
                 chunk_count,
-                plan.chunks.len(),
+                chunk_total_display,
                 config.work_dir,
                 &config,
                 &mut ctx,
@@ -579,7 +616,7 @@ pub async fn run_bounded_vocal_pipeline(
                     emit_chunk_progress(
                         app,
                         chunk_count.saturating_sub(1),
-                        plan.chunks.len(),
+                        chunk_total_display,
                         attempt.completed_until_frame,
                         source_info.frames,
                         ctx.memory_guard.peak_private_bytes(),
@@ -617,17 +654,25 @@ pub async fn run_bounded_vocal_pipeline(
             ChunkOutcome::MemoryLimit => {
                 let next = attempt.on_memory_limit()?;
                 retried = true;
+                chunk_total_display = chunk_count + next.chunks.len();
                 let _ = logger.write(
                     "retry_with_smaller_chunks",
                     &serde_json::json!({"core_sec": next.core_sec, "total_frames": next.total_frames}),
                 );
+                // 进度不重置到 0%：按已完成核心帧占比继续（单调不减），
+                // 分片编号接在已完成旧片之后（下一片是第 chunk_count+1/新总数 片）。
+                let retry_pct = if source_info.frames > 0 {
+                    attempt.completed_until_frame as f64 / source_info.frames as f64 * 100.0
+                } else {
+                    0.0
+                };
                 emit_vocal_progress(
                     app,
-                    0.0,
+                    retry_pct,
                     "内存占用过高，正在改用更小分片重试",
                     VocalProgressFields {
-                        chunk_index: 0,
-                        chunk_total: next.chunks.len(),
+                        chunk_index: chunk_count,
+                        chunk_total: chunk_total_display,
                         memory_bytes: peak_private,
                         memory_peak_bytes: peak_private,
                         memory_budget_bytes: ctx.budget,
@@ -736,8 +781,26 @@ mod tests {
         let path = unique_temp_wav("published-vocals");
         std::fs::write(&path, b"temporary vocals").unwrap();
         state.publish_output(token, path.clone()).unwrap();
-        state.release_output();
+        state.release_output(Some(&path));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn release_with_mismatched_path_keeps_current_published_output() {
+        let state = VocalState::default();
+        let token = state.begin();
+        let published = unique_temp_wav("current-vocals");
+        std::fs::write(&published, b"current vocals").unwrap();
+        state.publish_output(token, published.clone()).unwrap();
+        // 旧会话延迟到达的释放：路径不匹配 → 不动当前发布的人声轨
+        let stale = unique_temp_wav("stale-vocals");
+        std::fs::write(&stale, b"stale vocals").unwrap();
+        state.release_output(Some(&stale));
+        assert!(published.exists());
+        let _ = std::fs::remove_file(&stale);
+        // 归属匹配的释放仍然生效
+        state.release_output(Some(&published));
+        assert!(!published.exists());
     }
 
     #[test]

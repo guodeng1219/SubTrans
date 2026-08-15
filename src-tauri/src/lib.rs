@@ -1674,8 +1674,9 @@ async fn separate_vocals_inner(
         work_dir: &work,
         stable_output: &vocals_dest,
     };
-    // 整体 2 小时兜底：超时则换代取消（清理 worker 与已发布输出）
-    let result = tokio::time::timeout(
+    // 整体 2 小时兜底：超时则换代取消（清理 worker 与已发布输出）。
+    // 成功/失败/超时三态都写入任务日志终态，内存或 worker 问题后日志可定位最终失败码。
+    let result = match tokio::time::timeout(
         std::time::Duration::from_secs(2 * 3600),
         vocal_pipeline::run_bounded_vocal_pipeline(
             &app,
@@ -1686,11 +1687,29 @@ async fn separate_vocals_inner(
         ),
     )
     .await
-    .map_err(|_| {
-        vocal_state.cancel();
-        "高精度人声分离整体超时（2 小时），任务已终止（vocal_total_timeout）".to_string()
-    })?
-    .map_err(|e| format!("[{}] {}", e.code(), e.user_message()))?;
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            let _ = logger.write(
+                "task_failed",
+                &serde_json::json!({"code": e.code(), "message": e.user_message()}),
+            );
+            return Err(format!("[{}] {}", e.code(), e.user_message()));
+        }
+        Err(_) => {
+            vocal_state.cancel();
+            let _ = logger.write(
+                "task_failed",
+                &serde_json::json!({
+                    "code": "vocal_total_timeout",
+                    "message": "高精度人声分离整体超时（2 小时）",
+                }),
+            );
+            return Err(
+                "高精度人声分离整体超时（2 小时），任务已终止（vocal_total_timeout）".to_string()
+            );
+        }
+    };
     // 结果字段进任务日志（同时保证 VocalPipelineResult 各字段有真实消费方）
     let _ = logger.write(
         "pipeline_result",
@@ -2646,9 +2665,14 @@ fn cancel_vocal_separation(state: tauri::State<'_, vocal_pipeline::VocalState>) 
 }
 
 /// 释放当前会话的人声轨临时 WAV（识别结束后由前端调用）。
+/// `vocal_path` 为该会话持有的人声轨路径：只有与后端当前发布路径一致才删除——
+/// 旧会话延迟到达的释放指令不会误删新会话刚发布的人声轨。
 #[tauri::command]
-fn release_vocal_track(state: tauri::State<'_, vocal_pipeline::VocalState>) {
-    state.release_output();
+fn release_vocal_track(
+    state: tauri::State<'_, vocal_pipeline::VocalState>,
+    vocal_path: Option<String>,
+) {
+    state.release_output(vocal_path.as_deref().map(std::path::Path::new));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

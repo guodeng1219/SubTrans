@@ -2,12 +2,15 @@
 """BS-RoFormer 常驻人声分离服务（JSON Lines 行协议）。
 
 由 Rust 后端启动一次，把模型常驻内存，然后逐行处理分离请求：
-  stdin  : 每行一个 JSON，如
+  stdin  : 启动屏障 + 请求，每行一个 JSON：
+           启动后先读一行 {"op": "load"}（Rust 完成 Job 内存硬限绑定后才会发送；
+           收到 load 之前绝不加载模型，杜绝「spawn→取 PID→绑 Job」与
+           模型加载之间的竞态窗口），随后是
            {"op": "separate", "request_id": "sep-0007",
             "input_path": ".../input_0007.wav", "output_dir": ".../output_0007"}
            或 {"op": "shutdown"}
   stdout : 每行一个 JSON：
-           启动就绪 {"ready": true, "pid": <pid>}
+           启动就绪 {"ready": true, "pid": <pid>}（load 且模型加载成功后输出）
            成功     {"request_id": ..., "ok": true, "vocals_path": "...", "elapsed_ms": ...}
            失败     {"request_id": ..., "ok": false, "error_code": "separation_failed"|"memory_error", "message": "..."}
            启动失败 {"ready": false, "error_code": "model_load_failed", "error": "..."}
@@ -140,6 +143,24 @@ def serve(argv, stdin, stdout, stderr, separator_factory=create_separator):
     if device == "cpu":
         # 与 Rust 端 demucs 回退行为对齐：强制 torch 不启用 CUDA
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # 启动屏障：Rust 端先 spawn 取 PID、绑定 Job 内存硬限，随后发 {"op":"load"}。
+    # 收到 load 之前绝不加载模型——否则「spawn → 取 PID → 绑 Job」与模型加载
+    # 之间存在竞态窗口，长视频模型加载期可能瞬时超限。
+    first = stdin.readline()
+    if not first:
+        # stdin 被关闭：无人来发 load，直接退出
+        return
+    command = parse_request(first)
+    if "error_code" in command or command.get("op") != "load":
+        emit(
+            stdout,
+            {
+                "ready": False,
+                "error_code": "model_load_failed",
+                "error": 'expected {"op": "load"} before model load',
+            },
+        )
+        return
     try:
         separator = separator_factory(
             model_dir=model_dir,

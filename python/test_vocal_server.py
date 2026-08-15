@@ -58,6 +58,7 @@ class VocalServerProtocolTests(unittest.TestCase):
 
     def test_two_requests_load_model_once_and_return_matching_ids(self):
         requests = [
+            {"op": "load"},
             {"op": "separate", "request_id": "a", "input_path": "a.wav",
              "output_dir": os.path.join(self.temp_dir.name, "out-a")},
             {"op": "separate", "request_id": "b", "input_path": "b.wav",
@@ -74,6 +75,32 @@ class VocalServerProtocolTests(unittest.TestCase):
         self.assertTrue(rows[0]["ready"])
         self.assertEqual([rows[1]["request_id"], rows[2]["request_id"]], ["a", "b"])
         self.assertEqual(FakeSeparator.loads, 1)
+
+    def test_model_is_not_loaded_before_load_command(self):
+        # 启动屏障：Rust 绑定 Job 硬限之前绝不加载模型；
+        # 首行不是 load（或为空）时输出 ready:false 且 loads 保持 0
+        stdin = io.StringIO(json.dumps({"op": "separate", "request_id": "x",
+                                        "input_path": "x.wav",
+                                        "output_dir": self.temp_dir.name}) + "\n")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        vocal_server.serve(
+            ["model-dir", "model.ckpt", "cpu"], stdin, stdout, stderr, FakeSeparator
+        )
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertFalse(rows[0]["ready"])
+        self.assertEqual(rows[0]["error_code"], "model_load_failed")
+        self.assertEqual(FakeSeparator.loads, 0)
+
+    def test_empty_stdin_exits_without_loading(self):
+        stdin = io.StringIO("")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        vocal_server.serve(
+            ["model-dir", "model.ckpt", "cpu"], stdin, stdout, stderr, FakeSeparator
+        )
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(FakeSeparator.loads, 0)
 
     def test_bad_json_and_non_object_requests_return_errors(self):
         self.assertEqual(vocal_server.parse_request("{"), {"error_code": "bad_json"})

@@ -26,6 +26,9 @@ const state = {
   session: 0,
 };
 
+// 用户是否手动改选过人声分离模型：改选后 detectEnv 不再自动覆盖默认引擎
+let demucsModelChosen = false;
+
 // 边播边译的流水线状态
 const stream = {
   chunkLen: 120,     // 当前分片秒数（慢机降级到 45）
@@ -409,6 +412,10 @@ function initApp() {
     $("#hiQualityHint").textContent = $("#hiQuality").checked
       ? "开始时会先分离人声（BS-RoFormer / demucs，GPU 较快），再边播边译。可在「引擎」页检测/配置。"
       : "";
+  });
+  // 用户手动改选分离模型后，detectEnv 不再自动覆盖（默认策略只对未选择状态生效）
+  $("#demucsModel").addEventListener("change", () => {
+    demucsModelChosen = true;
   });
   $("#checkDemucs").addEventListener("click", async () => {
     $("#demucsStatus").textContent = "检测中...";
@@ -831,8 +838,9 @@ async function pump() {
     stream.filling = false;
     if (state.session !== sessionAtPump || !stream.running) return; // 补洞期间会话已切换
     // 识别全部结束：释放高精度模式的临时人声轨（GB 级临时 WAV 由后端会话管理）
+    // 携带本会话持有的路径：后端校验归属后才删除，旧会话延迟释放不会误删新会话文件
     if (stream.audioSource) {
-      await invoke("release_vocal_track").catch(() => {});
+      await invoke("release_vocal_track", { vocalPath: stream.audioSource }).catch(() => {});
       stream.audioSource = null;
     }
     const failed = stream.failedChunks || [];
@@ -1665,11 +1673,11 @@ async function saveAutosave() {
 
 async function restoreAutosave() {
   try {
+    // 会话令牌在 await 之前记录：等待 load_autosave 期间用户可能已打开新视频。
+    // 恢复结果按发起时的令牌校验，绝不把旧会话覆盖到新会话上
+    const sessionAtRestore = state.session;
     const p = await invoke("load_autosave");
     if (!p) return;
-    // 恢复期间用户可能已打开新视频/项目：applyProject 内部在目录等待后
-    // 已校验会话令牌，这里再兜底一次，避免把过期的恢复文案贴到新会话上
-    const sessionAtRestore = state.session;
     const applied = await applyProject(p);
     if (state.session !== sessionAtRestore) return;
     if (applied) {
@@ -2321,7 +2329,9 @@ async function detectEnv() {
   const cudaInstalled = env.has_gpu && env.cuda_torch_ready; // CUDA torch 已装（不管 fw/demucs 检测结果）
   const fwReady = gpuReady && env.fw_ready;
   const demucsReady = gpuReady && env.demucs_ready;
-  const audioSepReady = gpuReady && env.audio_sep_ready;
+  // 人声分离不绑定 GPU：audio-separator 在 CPU 上同样可跑（慢但可用），
+  // 只要组件就绪就显示高精度入口
+  const audioSepReady = env.audio_sep_ready;
   // 高精度模式只需人声分离引擎之一就绪：demucs 或 BS-RoFormer（audio-separator）
   const hiQualityReady = demucsReady || audioSepReady;
 
@@ -2331,16 +2341,23 @@ async function detectEnv() {
     localStorage.setItem("subtrans.pythonPath", env.python_path);
   }
 
-  // 只有 BS-RoFormer 就绪（demucs 缺失）时，模型默认切到 BS-RoFormer（value=""）
-  if (audioSepReady && !demucsReady) {
+  // 默认分离引擎：BS-RoFormer（有界分片管线，带内存硬限）可用时优先。
+  // 用户手动改选过则尊重其选择，不在每次探测时覆盖
+  if (audioSepReady && !demucsModelChosen) {
     $("#demucsModel").value = "";
+  }
+  // CPU 环境下分离设备默认 CPU（GPU 分支稍后会按需切回 cuda）
+  if (!gpuReady) {
+    $("#demucsDevice").value = "cpu";
   }
 
   // GPU 选项显示/隐藏
   showGroup("gpuRecGroup", fwReady);
   showGroup("hiQualityGroup", hiQualityReady);
   showGroup("fwCfgGroup", gpuReady);
-  showGroup("demucsCfgGroup", gpuReady);
+  // 人声分离配置组：GPU 就绪时保留（fw-only 机器用它检测/安装 demucs），
+  // CPU 上只有分离引擎就绪时才显示
+  showGroup("demucsCfgGroup", gpuReady || hiQualityReady);
   // Python 安装区：GPU 未就绪时展示，让用户有明确的修复入口
   showGroup("pySetupGroup", !gpuReady);
 
