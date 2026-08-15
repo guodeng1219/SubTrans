@@ -6,6 +6,7 @@ mod ffmpeg;
 mod fw_ipc;
 mod language_profiles;
 mod ollama;
+mod process_memory;
 mod python_setup;
 mod subtitle_parse;
 mod translate;

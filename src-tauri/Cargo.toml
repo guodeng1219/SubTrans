@@ -30,6 +30,17 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 
+# 人声分离 worker 进程树内存采样与 Windows Job Object 硬限
+sysinfo = "0.33"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
 anyhow = "1"
 dirs = "5"
 hound = "3.5"             # WAV 读取（喂给 whisper）
