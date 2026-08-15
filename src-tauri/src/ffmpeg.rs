@@ -4,7 +4,7 @@
 //! 超时丢弃 future 时子进程会被立刻杀死，不会留下孤儿进程或半成品文件。
 
 use anyhow::{anyhow, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
@@ -182,6 +182,196 @@ pub async fn extract_audio_full(video_path: &str, out_wav: &Path, ffmpeg_bin: &s
         out_wav.to_str().ok_or_else(|| anyhow!("无效输出路径"))?,
     ]);
     run_ffmpeg(cmd, out_wav).await
+}
+
+// ── 高精度人声分离：规范 PCM + 整数采样切窗（不重复 seek 压缩源） ──
+
+/// 44.1 kHz 双声道 16-bit 整数 PCM WAV 的校验信息。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcmWavInfo {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub bits_per_sample: u16,
+    pub frames: u64,
+}
+
+/// 校验 PCM WAV：44.1 kHz、双声道、16-bit 整数、非零帧数。
+/// 帧数按 WAV 头数据块精确读出，不做秒级取整。
+pub fn validate_pcm_wav(path: &Path) -> Result<PcmWavInfo> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    if spec.sample_rate != 44_100 {
+        return Err(anyhow!("采样率必须为 44100，实际 {}", spec.sample_rate));
+    }
+    if spec.channels != 2 {
+        return Err(anyhow!("声道数必须为 2，实际 {}", spec.channels));
+    }
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err(anyhow!("编码必须为 16-bit 整数 PCM"));
+    }
+    let frames = u64::from(reader.duration());
+    if frames == 0 {
+        return Err(anyhow!("PCM 帧数为 0"));
+    }
+    Ok(PcmWavInfo {
+        sample_rate: spec.sample_rate,
+        channels: spec.channels,
+        bits_per_sample: spec.bits_per_sample,
+        frames,
+    })
+}
+
+/// 规范 PCM 解码参数：顺序解码整条音轨，不带 `-ss`/`-t`。
+pub fn build_canonical_decode_args(
+    video_path: &str,
+    out_part: &Path,
+) -> Result<Vec<String>, String> {
+    let out = out_part.to_str().ok_or_else(|| "无效输出路径".to_string())?;
+    Ok(vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-i".into(),
+        video_path.to_string(),
+        "-vn".into(),
+        "-ac".into(),
+        "2".into(),
+        "-ar".into(),
+        "44100".into(),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        "-f".into(),
+        "wav".into(),
+        out.to_string(),
+    ])
+}
+
+/// 一次性把压缩源音轨流式解码为规范 PCM WAV（44.1 kHz 双声道 16-bit，只落盘不载入内存）。
+pub async fn decode_canonical_audio(
+    video_path: &str,
+    out_part: &Path,
+    ffmpeg_bin: &str,
+) -> Result<()> {
+    let args = build_canonical_decode_args(video_path, out_part).map_err(|e| anyhow!("{e}"))?;
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.args(&args);
+    run_ffmpeg(cmd, out_part).await
+}
+
+/// 构造 atrim 整数采样裁剪参数：`atrim=start_sample=S:end_sample=E,asetpts=PTS-STARTPTS`。
+/// 输入必须与输出同为 PCM，采样网格完全由整数决定，不使用 `-ss`/`-t`。
+fn build_atrim_args(
+    input: &Path,
+    out_part: &Path,
+    start_sample: u64,
+    end_sample: u64,
+) -> Result<Vec<String>, String> {
+    if end_sample <= start_sample {
+        return Err("无效采样范围：终点必须大于起点".into());
+    }
+    let input = input.to_str().ok_or_else(|| "无效输入路径".to_string())?;
+    let out = out_part.to_str().ok_or_else(|| "无效输出路径".to_string())?;
+    Ok(vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-i".into(),
+        input.to_string(),
+        "-af".into(),
+        format!("atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS"),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        "-f".into(),
+        "wav".into(),
+        out.to_string(),
+    ])
+}
+
+/// 纯参数构造：从规范 PCM 用整数 atrim 切窗（`extract_end_sample` 为开区间终点）。
+pub fn build_vocal_window_args(
+    canonical_wav: &Path,
+    out_part: &Path,
+    extract_start_sample: u64,
+    extract_end_sample: u64,
+) -> Result<Vec<String>, String> {
+    build_atrim_args(canonical_wav, out_part, extract_start_sample, extract_end_sample)
+}
+
+/// 纯参数构造：按 `trim_start_sample + core_frames` 的整数采样范围裁剪核心片。
+pub fn build_vocal_trim_args(
+    separated_wav: &Path,
+    out_part: &Path,
+    trim_start_sample: u64,
+    core_frames: u64,
+) -> Result<Vec<String>, String> {
+    let end =
+        trim_start_sample.checked_add(core_frames).ok_or_else(|| "裁剪终点溢出".to_string())?;
+    build_atrim_args(separated_wav, out_part, trim_start_sample, end)
+}
+
+/// 从规范 PCM 按整数采样范围切出模型输入窗口。
+pub async fn extract_vocal_window(
+    canonical_wav: &Path,
+    out_part: &Path,
+    ffmpeg_bin: &str,
+    extract_start_sample: u64,
+    extract_frames: u64,
+) -> Result<()> {
+    let end =
+        extract_start_sample.checked_add(extract_frames).ok_or_else(|| anyhow!("提取终点溢出"))?;
+    let args = build_vocal_window_args(canonical_wav, out_part, extract_start_sample, end)
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.args(&args);
+    run_ffmpeg(cmd, out_part).await
+}
+
+/// 从分离结果按整数采样偏移裁出核心片。
+pub async fn trim_vocal_core(
+    separated_wav: &Path,
+    out_part: &Path,
+    ffmpeg_bin: &str,
+    trim_start_sample: u64,
+    core_frames: u64,
+) -> Result<()> {
+    let args = build_vocal_trim_args(separated_wav, out_part, trim_start_sample, core_frames)
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.args(&args);
+    run_ffmpeg(cmd, out_part).await
+}
+
+/// 生成 concat 清单：只包含按固定模板生成的相对路径，用户路径绝不进入 concat 语法。
+pub fn concat_manifest(core_count: usize) -> String {
+    (0..core_count).map(|i| format!("file 'cores/vocals_{i:04}.wav'\n")).collect()
+}
+
+/// 用 FFmpeg concat demuxer 流式拼接核心片（`-c:a copy`，整轨 PCM 始终只落盘）。
+pub async fn concat_vocal_cores(
+    work_dir: &Path,
+    core_count: usize,
+    out_part: &Path,
+    ffmpeg_bin: &str,
+) -> Result<()> {
+    let manifest = work_dir.join("concat.txt");
+    std::fs::write(&manifest, concat_manifest(core_count))?;
+    let out = out_part.to_str().ok_or_else(|| anyhow!("无效输出路径"))?;
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.current_dir(work_dir);
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        "concat.txt",
+        "-c:a",
+        "copy",
+        "-f",
+        "wav",
+        out,
+    ]);
+    run_ffmpeg(cmd, out_part).await
 }
 
 /// 把 SRT 字幕烧录进视频（硬字幕）。srt 只传文件名，工作目录切到其所在目录
@@ -372,7 +562,91 @@ pub fn read_wav_as_f32(wav_path: &Path) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hhmmss;
+    use super::*;
+
+    fn test_wav_path(label: &str) -> PathBuf {
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("subtrans-{label}-{}-{stamp}.wav", std::process::id()))
+    }
+
+    fn write_test_wav(path: &Path, frames: u64) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..frames * 2 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn canonical_decode_args_stream_one_complete_pcm_track() {
+        let args = build_canonical_decode_args("movie.mp4", Path::new("source.wav.part")).unwrap();
+        let joined = args.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(!joined.contains("-ss"));
+        assert!(!joined.contains("-t"));
+        assert!(joined.contains("-vn"));
+        assert!(joined.contains("-ac 2"));
+        assert!(joined.contains("-ar 44100"));
+        assert!(joined.contains("-c:a pcm_s16le"));
+        assert!(joined.contains("-f wav"));
+    }
+
+    #[test]
+    fn vocal_window_args_cut_canonical_pcm_by_integer_samples() {
+        let args = build_vocal_window_args(
+            Path::new("source.wav"),
+            Path::new("input.wav.part"),
+            10_363_500,
+            21_388_500,
+        )
+        .unwrap();
+        let joined = args.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("atrim=start_sample=10363500:end_sample=21388500"));
+        assert!(joined.contains("asetpts=PTS-STARTPTS"));
+        assert!(!joined.contains("-ss"));
+    }
+
+    #[test]
+    fn pcm_validator_reports_frames_not_rounded_seconds() {
+        let path = test_wav_path("validator");
+        write_test_wav(&path, 44_101);
+        let info = validate_pcm_wav(&path).unwrap();
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.frames, 44_101);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concat_manifest_uses_generated_relative_paths_only() {
+        let text = concat_manifest(3);
+        assert_eq!(
+            text,
+            "file 'cores/vocals_0000.wav'\nfile 'cores/vocals_0001.wav'\nfile 'cores/vocals_0002.wav'\n"
+        );
+    }
+
+    #[test]
+    fn vocal_trim_args_use_integer_atrim_sample_offsets() {
+        let args = build_vocal_trim_args(
+            Path::new("vocals.wav"),
+            Path::new("core.wav.part"),
+            220_485,
+            10_584_000,
+        )
+        .unwrap();
+        let joined = args.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("atrim=start_sample=220485"));
+        assert!(joined.contains("end_sample=10804485"));
+        assert!(joined.contains("-c:a pcm_s16le"));
+        assert!(joined.contains("-f wav"));
+    }
 
     #[test]
     fn hhmmss_parses_ffmpeg_progress_time() {
