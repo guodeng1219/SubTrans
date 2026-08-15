@@ -1667,13 +1667,19 @@ async fn separate_vocals_inner(
             Ok(path) => {
                 // 发布到会话状态：release_vocal_track / cancel 才能按路径清理这份临时 WAV，
                 // 与 BS-RoFormer 管线一致；令牌过期时 publish_output 自行删除文件并报错
-                if let Err(e) = vocal_state.publish_output(token, PathBuf::from(path)) {
+                if vocal_state.publish_output(token, PathBuf::from(path)).is_err() {
                     let _ = logger.write(
                         "task_failed",
-                        &serde_json::json!({"code": "vocal_cancelled", "message": e}),
+                        &serde_json::json!({
+                            "code": "vocal_cancelled",
+                            "message": "分离完成但会话已切换，人声轨已丢弃",
+                        }),
                     );
                     return Err("任务已取消".into());
                 }
+                // 100% 只在发布成功后展示：取消恰好在复制与发布之间时，
+                // 进度条不会出现「100% 完成」与「任务已取消」的矛盾终态
+                emit_progress(&app, "separate", 100.0, "人声分离完成");
                 let _ = logger
                     .write("task_done", &serde_json::json!({"engine": "demucs", "output": path}));
             }
@@ -1776,12 +1782,14 @@ async fn separate_vocals_inner(
     Ok(result.output_path.to_string_lossy().to_string())
 }
 
-/// demucs 错误码映射：内存超限/取消给出稳定码，其余归为 demucs 失败。
+/// demucs 错误码映射：内存超限/取消/提取失败给出稳定码，其余归为 demucs 失败。
 fn demucs_error_code(message: &str) -> &'static str {
     if message.contains("内存超限") {
         "vocal_memory_limit_exceeded"
     } else if message.contains("任务已取消") {
         "vocal_cancelled"
+    } else if message.starts_with("[vocal_source_decode_failed]") {
+        "vocal_source_decode_failed"
     } else {
         "vocal_demucs_failed"
     }
@@ -1956,9 +1964,10 @@ async fn separate_demucs(
     if !vocals.exists() {
         return Err(format!("未找到分离结果: {}", vocals.display()));
     }
-    // 复制到工作目录之外的稳定路径，然后清理工作目录（守护对象在函数结束时删除）
+    // 复制到工作目录之外的稳定路径，然后清理工作目录（守护对象在函数结束时删除）。
+    // 注意：100% 完成进度由调用方在 publish_output 成功后才发出——
+    // 取消恰好在复制与发布之间时不得出现「已完成」与「已取消」的矛盾终态。
     std::fs::copy(&vocals, vocals_dest).map_err(|e| format!("保存人声轨失败: {e}"))?;
-    emit_progress(app, "separate", 100.0, "人声分离完成");
     Ok(vocals_dest.to_string_lossy().to_string())
 }
 
