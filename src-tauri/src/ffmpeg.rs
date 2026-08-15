@@ -198,7 +198,7 @@ pub struct PcmWavInfo {
 /// 校验 PCM WAV：44.1 kHz、双声道、16-bit 整数、非零帧数。
 /// 帧数按 WAV 头数据块精确读出，不做秒级取整。
 pub fn validate_pcm_wav(path: &Path) -> Result<PcmWavInfo> {
-    let mut reader = hound::WavReader::open(path)?;
+    let reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     if spec.sample_rate != 44_100 {
         return Err(anyhow!("采样率必须为 44100，实际 {}", spec.sample_rate));

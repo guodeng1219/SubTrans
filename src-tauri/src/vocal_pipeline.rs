@@ -238,6 +238,7 @@ where
 }
 
 /// 进度封装：pct 按已完成核心帧数计算。
+#[allow(clippy::too_many_arguments)] // 分片进度展示所需的完整上下文
 fn emit_chunk_progress(
     app: &tauri::AppHandle,
     done: usize,
@@ -334,11 +335,19 @@ async fn process_one_chunk(
                     Ok(sample) => {
                         match ctx.memory_guard.observe(sample) {
                             MemoryDecision::Warn => {
-                                let _ = logger.write("memory_warn", &serde_json::json!({"budget_bytes": ctx.budget}));
+                                let _ = logger.write(
+                                    "memory_warn",
+                                    &serde_json::json!({
+                                        "budget_bytes": ctx.budget,
+                                        "working_set_bytes": sample.working_set_bytes,
+                                        "private_bytes": sample.private_bytes,
+                                    }),
+                                );
                                 emit_chunk_progress(app, global_index, chunk_total, 0, 0, ctx, false, true);
                             }
                             MemoryDecision::Exceeded => {
                                 let _ = logger.write("memory_exceeded", &serde_json::json!({"budget_bytes": ctx.budget}));
+                                ctx.job.terminate(1); // Job 整树终止（KILL_ON_JOB_CLOSE 兜底）
                                 ctx.worker.kill().await;
                                 return Ok(ChunkOutcome::MemoryLimit);
                             }
@@ -376,6 +385,7 @@ async fn process_one_chunk(
                 werr.code == "memory_error",
             );
             if class == WorkerFailureClass::MemoryLimit {
+                ctx.job.terminate(1);
                 ctx.worker.kill().await;
                 let _ = logger.write(
                     "worker_failure_classified_memory",
@@ -387,6 +397,7 @@ async fn process_one_chunk(
                 );
                 return Ok(ChunkOutcome::MemoryLimit);
             }
+            ctx.job.terminate(1);
             ctx.worker.kill().await;
             let code: &'static str = match werr.code.as_str() {
                 "vocal_worker_exited" => "vocal_worker_exited",
@@ -503,7 +514,6 @@ pub async fn run_bounded_vocal_pipeline(
     loop {
         let mut ctx = WorkerCtx::start(&config, logger).await?;
         let mut outcome: Result<ChunkOutcome, VocalPipelineError> = Ok(ChunkOutcome::Done);
-        let mut completed_frames = attempt.completed_until_frame;
         for chunk in &plan.chunks {
             match process_one_chunk(
                 app,
@@ -522,13 +532,12 @@ pub async fn run_bounded_vocal_pipeline(
             {
                 Ok(ChunkOutcome::Done) => {
                     attempt.mark_completed(chunk.core_end_frame());
-                    completed_frames = attempt.completed_until_frame;
                     chunk_count += 1;
                     emit_chunk_progress(
                         app,
                         chunk_count.saturating_sub(1),
                         plan.chunks.len(),
-                        completed_frames,
+                        attempt.completed_until_frame,
                         source_info.frames,
                         &ctx,
                         retried,
@@ -566,7 +575,7 @@ pub async fn run_bounded_vocal_pipeline(
                 retried = true;
                 let _ = logger.write(
                     "retry_with_smaller_chunks",
-                    &serde_json::json!({"core_sec": next.core_sec}),
+                    &serde_json::json!({"core_sec": next.core_sec, "total_frames": next.total_frames}),
                 );
                 emit_vocal_progress(
                     app,

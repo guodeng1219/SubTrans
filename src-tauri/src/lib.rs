@@ -1663,7 +1663,7 @@ async fn separate_vocals_inner(
         vocal_state.cancel();
         "高精度人声分离整体超时（2 小时），任务已终止（vocal_total_timeout）".to_string()
     })?
-    .map_err(|e| e.user_message())?;
+    .map_err(|e| format!("[{}] {}", e.code(), e.user_message()))?;
     // 结果字段进任务日志（同时保证 VocalPipelineResult 各字段有真实消费方）
     let _ = logger.write(
         "pipeline_result",
