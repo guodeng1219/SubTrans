@@ -36,8 +36,12 @@ fn download_ffmpeg_if_missing() {
     #[cfg(target_os = "macos")]
     {
         download_ffmpeg_macos(&dest);
+        // macOS 不内置 ffprobe：ffmpeg-static 单文件不包含 ffprobe，也没有可靠的
+        // 现代静态 ffprobe 源（evermeet 仅 x64 且已停发 ffprobe；ffprobe-static 停留在
+        // ffmpeg 3.1）。tauri.macos.conf.json 已把 macOS 的 externalBin 收敛为仅 ffmpeg，
+        // 运行时 resolve_ffprobe 回退系统 PATH。
         println!(
-            "cargo:warning=macOS 不内置 ffprobe（ffmpeg-static 单文件不包含），运行时回退系统 PATH"
+            "cargo:warning=macOS 不内置 ffprobe（tauri.macos.conf.json 仅声明 ffmpeg sidecar），运行时回退系统 PATH"
         );
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

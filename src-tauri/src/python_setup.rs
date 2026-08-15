@@ -6,18 +6,81 @@ use std::path::Path;
 use tauri::Manager;
 
 const PYTHON_VERSION: &str = "3.12.9";
-const PYTHON_ZIP: &str = "python-3.12.9-embed-amd64.zip";
 
-/// 下载 + 安装 Python 环境，返回 python.exe 路径。
+/// 平台对应的 python.org 发行包：Windows 用 embeddable zip（免安装），
+/// macOS 用官方 pkg（installer 装到用户目录，无需管理员密码）。
+#[cfg(target_os = "windows")]
+const PYTHON_ARCHIVE: &str = "python-3.12.9-embed-amd64.zip";
+#[cfg(target_os = "macos")]
+const PYTHON_ARCHIVE: &str = "python-3.12.9-macos11.pkg";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const PYTHON_ARCHIVE: &str = "";
+
+/// python.org 用户级安装位置：`installer -pkg ... -target CurrentUserHomeDirectory`
+/// 装到 ~/Library/Python/<major.minor>/，解释器为 bin/python<major.minor>。
+#[cfg(target_os = "macos")]
+fn macos_python_exe() -> Result<std::path::PathBuf, String> {
+    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+    let parts: Vec<&str> = PYTHON_VERSION.split('.').collect();
+    let ver = format!("{}.{}", parts[0], parts.get(1).unwrap_or(&"0"));
+    Ok(home
+        .join("Library")
+        .join("Python")
+        .join(&ver)
+        .join("bin")
+        .join(format!("python{ver}")))
+}
+
+/// 下载官方 pkg 并安装到当前用户目录（无需管理员密码）。
+#[cfg(target_os = "macos")]
+async fn install_macos_python(
+    app: &tauri::AppHandle,
+    data_dir: &Path,
+) -> Result<(), String> {
+    emit_progress(app, "python_setup", 5.0, "下载 Python 环境（官方安装包，约 45MB）...");
+    let pkg = data_dir.join(PYTHON_ARCHIVE);
+    download_python_archive(&pkg).await?;
+
+    emit_progress(app, "python_setup", 20.0, "安装 Python 环境（用户级安装，无需密码）...");
+    let pkg_str = pkg.to_string_lossy().to_string();
+    let status = std::process::Command::new("installer")
+        .args(["-pkg", pkg_str.as_str(), "-target", "CurrentUserHomeDirectory"])
+        .status()
+        .map_err(|e| format!("启动 installer 失败: {e}"))?;
+    let _ = std::fs::remove_file(&pkg);
+    if !status.success() {
+        return Err(
+            "安装 Python 失败（installer 返回非零退出码），请到 python.org 手动安装".into(),
+        );
+    }
+    let exe = macos_python_exe()?;
+    if !exe.exists() {
+        return Err(format!("安装完成但未找到解释器 {}（安装布局异常）", exe.display()));
+    }
+    Ok(())
+}
+
+/// 下载 + 安装 Python 环境，返回解释器路径（Windows 为 python.exe，macOS 为 python3.12）。
 pub async fn setup(app: &tauri::AppHandle) -> Result<String, String> {
     let data_dir = app.path().app_data_dir().map_err(|e| format!("获取数据目录失败: {e}"))?;
-    let py_dir = data_dir.join("python");
-    let py_exe = py_dir.join("python.exe");
+
+    // 平台差异：Windows 解压 embeddable 到数据目录；
+    // macOS 用官方 pkg 装到 ~/Library/Python（用户级，无需管理员密码）。
+    #[cfg(target_os = "windows")]
+    let (py_dir, py_exe) = {
+        let dir = data_dir.join("python");
+        (dir.clone(), dir.join("python.exe"))
+    };
+    #[cfg(target_os = "macos")]
+    let (py_dir, py_exe) = (std::env::temp_dir(), macos_python_exe()?);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let (py_dir, py_exe) = (std::env::temp_dir(), std::path::PathBuf::from("python3"));
 
     // 已存在时不能直接返回：上次安装可能中断（缺 pip / 缺依赖包），
     // 先补齐 ._pth、pip，再检查 GPU 栈，缺什么补什么。
     if py_exe.exists() {
         emit_progress(app, "python_setup", 10.0, "检测到已有 Python，检查组件完整性...");
+        #[cfg(target_os = "windows")]
         let _ = configure_embed_pth(&py_dir);
         ensure_pip(&py_exe, &py_dir).await?;
         if !python_has_stack(&py_exe).await {
@@ -28,53 +91,64 @@ pub async fn setup(app: &tauri::AppHandle) -> Result<String, String> {
         return Ok(py_exe.to_string_lossy().to_string());
     }
 
-    std::fs::create_dir_all(&py_dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    #[cfg(target_os = "windows")]
+    {
+        std::fs::create_dir_all(&py_dir).map_err(|e| format!("创建目录失败: {e}"))?;
 
-    // 1) 下载 Python embeddable
-    emit_progress(app, "python_setup", 5.0, "下载 Python 环境...");
-    let zip_path = py_dir.join(PYTHON_ZIP);
-    download_python_zip(&zip_path).await?;
+        // 1) 下载 Python embeddable
+        emit_progress(app, "python_setup", 5.0, "下载 Python 环境...");
+        let zip_path = py_dir.join(PYTHON_ARCHIVE);
+        download_python_archive(&zip_path).await?;
 
-    // 2) 解压
-    emit_progress(app, "python_setup", 20.0, "解压 Python 环境...");
-    extract_zip(&zip_path, &py_dir)?;
-    let _ = std::fs::remove_file(&zip_path);
+        // 2) 解压
+        emit_progress(app, "python_setup", 20.0, "解压 Python 环境...");
+        extract_zip(&zip_path, &py_dir)?;
+        let _ = std::fs::remove_file(&zip_path);
 
-    // 3) 配置 pip：修改 ._pth 文件取消注释 import site
-    emit_progress(app, "python_setup", 25.0, "配置 pip...");
-    configure_embed_pth(&py_dir)?;
+        // 3) 配置 pip：修改 ._pth 文件取消注释 import site
+        emit_progress(app, "python_setup", 25.0, "配置 pip...");
+        configure_embed_pth(&py_dir)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        install_macos_python(app, &data_dir).await?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        return Err("当前平台暂不支持一键安装 Python 环境，请到 python.org 手动安装".into());
+    }
 
-    // 4) 安装 pip
-    emit_progress(app, "python_setup", 30.0, "安装 pip...");
-    let get_pip = py_dir.join("get-pip.py");
-    download_get_pip(&get_pip).await?;
-    run_python(&py_exe, &[get_pip.to_string_lossy().as_ref()], &py_dir).await?;
-    let _ = std::fs::remove_file(&get_pip);
-
-    // 5) 安装 GPU 识别栈（CUDA 版 torch + faster-whisper/demucs/soundfile）
+    // 通用：确认 pip + 安装识别/分离组件
+    ensure_pip(&py_exe, &py_dir).await?;
     install_gpu_stack(app, &py_exe).await?;
 
     emit_progress(app, "python_setup", 100.0, "Python 环境就绪");
     Ok(py_exe.to_string_lossy().to_string())
 }
 
-async fn download_python_zip(dest: &Path) -> Result<(), String> {
+async fn download_python_archive(dest: &Path) -> Result<(), String> {
     let urls = [
-        format!("https://mirrors.tuna.tsinghua.edu.cn/python/{PYTHON_VERSION}/{PYTHON_ZIP}"),
-        format!("https://mirrors.huaweicloud.com/python/{PYTHON_VERSION}/{PYTHON_ZIP}"),
-        format!("https://www.python.org/ftp/python/{PYTHON_VERSION}/{PYTHON_ZIP}"),
+        format!("https://mirrors.tuna.tsinghua.edu.cn/python/{PYTHON_VERSION}/{PYTHON_ARCHIVE}"),
+        format!("https://mirrors.huaweicloud.com/python/{PYTHON_VERSION}/{PYTHON_ARCHIVE}"),
+        format!("https://www.python.org/ftp/python/{PYTHON_VERSION}/{PYTHON_ARCHIVE}"),
     ];
 
     for url in &urls {
         match download_file(url, dest).await {
             Ok(()) => {
-                // ZIP 魔数 + 体积双校验：镜像"软 404"（HTTP 200 错误页）会被当完整文件
+                // 魔数 + 体积双校验：镜像"软 404"（HTTP 200 错误页）会被当完整文件。
+                // Windows zip 以 PK\x03\x04 开头；macOS pkg 是 xar 归档（"xar!"）。
                 let head = std::fs::read(dest).unwrap_or_default();
-                if head.len() > 5_000_000 && head.starts_with(b"PK\x03\x04") {
+                let magic_ok = if cfg!(target_os = "windows") {
+                    head.starts_with(b"PK\x03\x04")
+                } else {
+                    head.starts_with(b"xar!")
+                };
+                if head.len() > 5_000_000 && magic_ok {
                     return Ok(());
                 }
                 let _ = std::fs::remove_file(dest);
-                eprintln!("python_setup: {url}: 下载内容不是有效 ZIP（魔数/体积校验失败）");
+                eprintln!("python_setup: {url}: 下载内容不是有效发行包（魔数/体积校验失败）");
             }
             Err(e) => {
                 let _ = std::fs::remove_file(dest);
@@ -138,6 +212,7 @@ async fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 /// 用 tar 或 Expand-Archive 解压 zip。
+#[cfg(target_os = "windows")]
 fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
     // 优先用 tar（Windows 10 1803+ 内置）
     let mut tar = std::process::Command::new("tar");
@@ -176,6 +251,7 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn find_powershell_exe() -> String {
     let candidates = [
         r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
@@ -190,6 +266,7 @@ fn find_powershell_exe() -> String {
 }
 
 /// 修改 embeddable Python 的 ._pth 文件，取消注释 `#import site` 使 pip 可用。
+#[cfg(target_os = "windows")]
 fn configure_embed_pth(py_dir: &Path) -> Result<(), String> {
     // embeddable 的 ._pth 文件名只含 major+minor（如 python312._pth），不含 patch 版本号
     let parts: Vec<&str> = PYTHON_VERSION.split('.').collect();
@@ -305,73 +382,98 @@ async fn install_gpu_stack(app: &tauri::AppHandle, py_exe: &Path) -> Result<(), 
     .await
     .map_err(|e| format!("网络预检失败（pip 无法从阿里云镜像安装包）: {e}"))?;
 
-    // 1) CUDA 版 torch：多个 CUDA wheel 源依次尝试，全失败则用 CPU 版兜底
-    emit_progress(
-        app,
-        "python_setup",
-        40.0,
-        "下载 CUDA 版 torch（约 2.5GB，较慢，请耐心等待，勿关闭窗口）...",
-    );
-    let cu_mirrors: &[&str] = &[
-        "https://mirror.sjtu.edu.cn/pytorch-wheels/cu124",
-        "https://mirrors.nju.edu.cn/pytorch-wheels/cu124",
-        "https://download.pytorch.org/whl/cu124",
-    ];
+    // 1) torch：macOS 没有 cu124 wheel（Apple Silicon 的 GPU 加速由官方轮子自带的 MPS
+    //    提供），直接装 PyPI 版；Windows/Linux 依次尝试 CUDA wheel 源，全失败则 CPU 版兜底。
+    #[cfg(target_os = "macos")]
+    let torch_ok = false;
+    #[cfg(not(target_os = "macos"))]
     let mut torch_ok = false;
+    #[cfg(not(target_os = "macos"))]
     let mut torch_source: Option<&str> = None;
-    for cu_idx in cu_mirrors {
-        if !mirror_reachable(cu_idx).await {
-            continue;
-        }
-        // 只用 CUDA 源安装，绝不加 --extra-index-url（PyPI 只有 CPU 版 torch，
-        // 混源时 pip 会挑版本更新的 CPU 版 → “装成功但 torch.cuda 不可用”）。
-        let install_ok = pip_install(
-            app,
-            py_exe,
-            &[
-                "-m",
-                "pip",
-                "install",
-                "--index-url",
-                cu_idx,
-                "--no-cache-dir",
-                "torch",
-                "torchaudio",
-            ],
-            60.0,
-            "torch",
-        )
-        .await
-        .is_ok();
-        // 装完必须实测 CUDA，防止源本身没有 CUDA 轮子或依赖解析异常
-        if install_ok && torch_cuda_ready(py_exe).await {
-            torch_ok = true;
-            torch_source = Some(cu_idx);
-            break;
-        }
-        // 清理残留（半成品 / CPU 版），换下一个源重试
-        let _ = run_python(
-            py_exe,
-            &["-m", "pip", "uninstall", "-y", "torch", "torchaudio"],
-            &std::env::temp_dir(),
-        )
-        .await;
-    }
-    if !torch_ok {
+    #[cfg(target_os = "macos")]
+    {
         emit_progress(
             app,
             "python_setup",
-            65.0,
-            "CUDA 镜像不可达，改用 CPU 版 torch（GPU 识别不可用，其余功能正常）...",
+            40.0,
+            "安装 torch / torchaudio（macOS 无 CUDA 轮子；Apple Silicon 自动启用 MPS）...",
         );
         pip_install(
             app,
             py_exe,
             &["-m", "pip", "install", "-i", pypi, "torch", "torchaudio"],
-            70.0,
-            "torch-cpu",
+            60.0,
+            "torch",
         )
         .await?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        emit_progress(
+            app,
+            "python_setup",
+            40.0,
+            "下载 CUDA 版 torch（约 2.5GB，较慢，请耐心等待，勿关闭窗口）...",
+        );
+        let cu_mirrors: &[&str] = &[
+            "https://mirror.sjtu.edu.cn/pytorch-wheels/cu124",
+            "https://mirrors.nju.edu.cn/pytorch-wheels/cu124",
+            "https://download.pytorch.org/whl/cu124",
+        ];
+        for cu_idx in cu_mirrors {
+            if !mirror_reachable(cu_idx).await {
+                continue;
+            }
+            // 只用 CUDA 源安装，绝不加 --extra-index-url（PyPI 只有 CPU 版 torch，
+            // 混源时 pip 会挑版本更新的 CPU 版 → “装成功但 torch.cuda 不可用”）。
+            let install_ok = pip_install(
+                app,
+                py_exe,
+                &[
+                    "-m",
+                    "pip",
+                    "install",
+                    "--index-url",
+                    cu_idx,
+                    "--no-cache-dir",
+                    "torch",
+                    "torchaudio",
+                ],
+                60.0,
+                "torch",
+            )
+            .await
+            .is_ok();
+            // 装完必须实测 CUDA，防止源本身没有 CUDA 轮子或依赖解析异常
+            if install_ok && torch_cuda_ready(py_exe).await {
+                torch_ok = true;
+                torch_source = Some(cu_idx);
+                break;
+            }
+            // 清理残留（半成品 / CPU 版），换下一个源重试
+            let _ = run_python(
+                py_exe,
+                &["-m", "pip", "uninstall", "-y", "torch", "torchaudio"],
+                &std::env::temp_dir(),
+            )
+            .await;
+        }
+        if !torch_ok {
+            emit_progress(
+                app,
+                "python_setup",
+                65.0,
+                "CUDA 镜像不可达，改用 CPU 版 torch（GPU 识别不可用，其余功能正常）...",
+            );
+            pip_install(
+                app,
+                py_exe,
+                &["-m", "pip", "install", "-i", pypi, "torch", "torchaudio"],
+                70.0,
+                "torch-cpu",
+            )
+            .await?;
+        }
     }
 
     // 2) 其余包（audio-separator 用于 BS-RoFormer 人声分离，demucs 作为回退）
@@ -405,6 +507,8 @@ async fn install_gpu_stack(app: &tauri::AppHandle, py_exe: &Path) -> Result<(), 
 
     // 3) 其余包可能把 torch 覆盖成 CPU 版（pip 依赖解析优先 PyPI 新版本）：
     //    装完再验证一次，丢了 CUDA 就重装 CUDA 版。
+    //    macOS 没有 CUDA 轮子（torch_ok 恒为 false），此修复步骤不适用。
+    #[cfg(not(target_os = "macos"))]
     if torch_ok && !torch_cuda_ready(py_exe).await {
         emit_progress(
             app,
@@ -462,6 +566,7 @@ pub(crate) async fn torch_cuda_ready(py_exe: &Path) -> bool {
 /// 快速探测 URL 是否可达（5s 超时）。
 /// 部分 wheel 索引对 HEAD 返回 405（GET 正常），HEAD 失败时回退带 Range 的 GET 探测，
 /// 避免 CUDA 镜像被误判不可达而白白降级 CPU torch。
+#[cfg(not(target_os = "macos"))] // 仅 Windows/Linux 的 CUDA 镜像链使用
 async fn mirror_reachable(url: &str) -> bool {
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()
     {

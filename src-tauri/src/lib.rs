@@ -623,10 +623,16 @@ fn resolve_python(app: &tauri::AppHandle) -> String {
 
 /// 解析 ffmpeg 路径：生产环境用 sidecar（与 exe 同级），开发环境用 PATH。
 fn resolve_ffmpeg(app: &tauri::AppHandle) -> String {
-    // Tauri 2 的 externalBin 把 sidecar 放在主 exe 同级目录
+    // Tauri 2 的 externalBin 把 sidecar 放在主 exe 同级目录；
+    // 文件名去掉目标三元组后缀：Windows 带 .exe，macOS/Linux 无后缀。
+    //（曾固定拼 "ffmpeg.exe"：macOS 上永远找不到 sidecar，只能回退系统 PATH。）
+    #[cfg(target_os = "windows")]
+    let sidecar_name = "ffmpeg.exe";
+    #[cfg(not(target_os = "windows"))]
+    let sidecar_name = "ffmpeg";
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sidecar = dir.join("ffmpeg.exe");
+            let sidecar = dir.join(sidecar_name);
             if sidecar.exists() {
                 return sidecar.to_string_lossy().to_string();
             }
@@ -634,7 +640,7 @@ fn resolve_ffmpeg(app: &tauri::AppHandle) -> String {
     }
     // 回退：resource_dir（兼容旧布局）
     if let Ok(dir) = app.path().resource_dir() {
-        let bundled = dir.join("ffmpeg.exe");
+        let bundled = dir.join(sidecar_name);
         if bundled.exists() {
             return bundled.to_string_lossy().to_string();
         }
@@ -1304,6 +1310,20 @@ fn python_candidate_dirs() -> Vec<String> {
     for ver in &["314", "313", "312", "311", "310", "39", "38"] {
         dirs.push(format!("C:\\Python{ver}\\python.exe"));
     }
+    #[cfg(target_os = "macos")]
+    {
+        // python.org 用户级安装（本应用「一键安装 Python」用
+        // `installer -pkg ... -target CurrentUserHomeDirectory` 装到
+        // ~/Library/Python/<major.minor>/bin/）。macOS 没有 LOCALAPPDATA 与 C:\ 路径，
+        // 不显式探测会找不到刚装好的解释器。
+        if let Some(home) = dirs::home_dir() {
+            for ver in ["3.12", "3.13", "3.11", "3.10", "3.9"] {
+                let bin = home.join("Library").join("Python").join(ver).join("bin");
+                dirs.push(bin.join(format!("python{ver}")).to_string_lossy().to_string());
+                dirs.push(bin.join("python3").to_string_lossy().to_string());
+            }
+        }
+    }
     dirs
 }
 
@@ -1697,16 +1717,21 @@ fn open_project_file(path: String) -> Result<serde_json::Value, String> {
 
 /// 解析 ffprobe 路径：生产环境用 sidecar（与 exe 同级），开发环境回退 PATH。
 fn resolve_ffprobe(app: &tauri::AppHandle) -> String {
+    // 与 resolve_ffmpeg 相同：文件名按平台决定（Windows 带 .exe）
+    #[cfg(target_os = "windows")]
+    let sidecar_name = "ffprobe.exe";
+    #[cfg(not(target_os = "windows"))]
+    let sidecar_name = "ffprobe";
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sidecar = dir.join("ffprobe.exe");
+            let sidecar = dir.join(sidecar_name);
             if sidecar.exists() {
                 return sidecar.to_string_lossy().to_string();
             }
         }
     }
     if let Ok(dir) = app.path().resource_dir() {
-        let bundled = dir.join("ffprobe.exe");
+        let bundled = dir.join(sidecar_name);
         if bundled.exists() {
             return bundled.to_string_lossy().to_string();
         }
@@ -2386,12 +2411,39 @@ fn ensure_ffmpeg_on_path() {
     }
 }
 
+/// identifier 从 `com.subtrans.app` 改为 `com.subtrans.desktop` 后，应用数据目录
+/// （自动保存草稿、已下载模型、日志等）的路径随之变化。正式版未发布，但开发机/内测机
+/// 可能已在旧目录积累了数据，启动时做一次性迁移：旧目录整个改名为新目录。
+/// 同父目录下 rename 是原子操作；失败（占用/权限）不阻塞启动，旧数据原地保留。
+fn migrate_legacy_data_dir(app: &tauri::AppHandle) {
+    let Ok(new_dir) = app.path().app_data_dir() else { return };
+    if new_dir.exists() {
+        return; // 新目录已有数据：不动旧目录，避免覆盖更新内容
+    }
+    let Some(parent) = new_dir.parent() else { return };
+    let legacy = parent.join("com.subtrans.app");
+    if !legacy.exists() {
+        return;
+    }
+    if std::fs::rename(&legacy, &new_dir).is_ok() {
+        log_err(
+            app,
+            "migrate",
+            &format!("已把旧数据目录 {} 迁移到 {}", legacy.display(), new_dir.display()),
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ensure_ffmpeg_on_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            migrate_legacy_data_dir(app.handle());
+            Ok(())
+        })
         .manage(AsrCache::default())
         .manage(FwState::default())
         .invoke_handler(tauri::generate_handler![

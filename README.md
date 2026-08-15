@@ -120,6 +120,10 @@ Whisper 需要先把视频转成音频，这一步用 ffmpeg。**现在已自动
 
 > 运行时定位顺序：主 exe 同级（sidecar）→ `resource_dir()`（旧布局）→ 系统 PATH。
 > 前端不再传 ffmpeg 路径。
+>
+> macOS 不内置 ffprobe sidecar（无可靠的现代静态 ffprobe 源，`tauri.macos.conf.json`
+> 已把 macOS 的 externalBin 收敛为仅 ffmpeg）：`ffprobe` 回退系统 PATH，未装 ffmpeg 的
+> Mac 上仅「视频信息面板」不可用，识别/波形/烧录等核心功能不受影响。
 
 ---
 
@@ -202,6 +206,7 @@ subtrans/
 ├── src-tauri/                   Rust 后端
 │   ├── Cargo.toml
 │   ├── tauri.conf.json          打包配置（nsis + dmg + ffmpeg sidecar）
+│   ├── tauri.macos.conf.json    macOS 平台专属配置（externalBin 仅 ffmpeg）
 │   ├── build.rs                 构建时自动下载 ffmpeg 到 binaries/
 │   ├── binaries/                ffmpeg sidecar（build.rs 自动放置）
 │   ├── capabilities/default.json 权限
