@@ -165,6 +165,13 @@ function initWizard() {
     }
   });
 
+  // 离线/下载失败时的逃生通道：先用内置 tiny 模型进入主界面（按钮仅在检测到内置模型时显示）
+  $("#skipModelBtn").addEventListener("click", () => {
+    state.modelName = "tiny";
+    localStorage.setItem("subtrans.model", "tiny");
+    goto(1);
+  });
+
   // 步骤2：翻译方式切换
   $$(".opt-card").forEach((card) => {
     card.addEventListener("click", () => {
@@ -180,6 +187,7 @@ function initWizard() {
   (async () => {
     try {
       const env = await invoke("env_status");
+      if (env.bundled_tiny) $("#skipModelBtn").classList.remove("hidden");
       if (env.has_gpu && env.cuda_torch_ready && (env.fw_ready || env.demucs_ready)) {
         $("#wizardPyStatus").textContent = "✓ 检测到 GPU 加速可用。";
         $("#wizardPyStatus").style.color = "var(--accent)";
@@ -408,9 +416,10 @@ function initApp() {
     if (!v || !v.duration) return;
     switch (e.key) {
       case " ": {
-        // 焦点在按钮上时，空格会二次触发按钮 click，直接放行不拦截
+        // 焦点在按钮/视频元素上时，交给原生行为（按钮=点击，视频=原生播放切换），
+        // 避免全局快捷键与原生行为双触发互相抵消
         const ae = document.activeElement;
-        if (ae && ae.tagName === "BUTTON") return;
+        if (ae && (ae.tagName === "BUTTON" || ae === v)) return;
         e.preventDefault();
         if (v.paused) v.play().catch(() => {});
         else v.pause();
@@ -504,7 +513,8 @@ function initApp() {
     wfDrag = true;
     seekWaveform(e);
   });
-  wfWrap.addEventListener("mousemove", (e) => {
+  // mousemove 挂 document：拖拽移出波形条外仍能连续定位
+  document.addEventListener("mousemove", (e) => {
     if (wfDrag) seekWaveform(e);
   });
   document.addEventListener("mouseup", () => {
@@ -518,7 +528,8 @@ async function openVideo() {
     filters: [{ name: "视频", extensions: ["mp4", "mkv", "avi", "mov", "webm", "flv", "m4v"] }],
   });
   if (!path) return;
-  // 先落盘当前会话草稿，再切换：避免 30s 周期/关闭时用"新视频+空字幕"覆盖旧草稿
+  // 先提交未完成的行内编辑（对象已脱离数组，直接丢弃）；再落盘当前会话草稿
+  commitInlineEdit();
   await saveAutosave();
   // 切换视频前停掉旧流水线，避免旧任务继续往新列表里塞字幕
   stream.running = false;
@@ -664,13 +675,15 @@ async function pump() {
   if (stream.done && stream.running && state.videoPath === videoAtPump) {
     const failed = stream.failedChunks || [];
     const failMsg = failed.length ? `（${failed.length} 个分片出错已跳过：${failed.map(f => fmt(f.start)).join(", ")}）` : "";
-    $("#runMsg").textContent = `字幕已全部生成（至 ${fmt(stream.total)}）${failMsg}`;
+    $("#runMsg").textContent = `字幕已全部生成（至 ${fmt(stream.total)}）${failMsg} · 左侧抽屉中双击可编辑`;
     $("#startBtn").disabled = false;
     $("#exportBtn").disabled = state.subtitles.length === 0;
     stream.failedChunks = [];
     // 步骤 2 完成 → 自动跳到步骤 3 查看结果
     setStepDone(2);
     goStep(3);
+    // 自动打开字幕抽屉：让用户立刻看到生成的字幕和编辑入口
+    if (state.subtitles.length) $("#subsDrawer").classList.remove("hidden");
   }
 }
 
@@ -828,7 +841,7 @@ function buildRow(sub, idx) {
     <div class="sub-text">
       ${sub.speaker ? `<span class="speaker-badge">${escapeHtml(sub.speaker)}</span>` : ""}
       <div class="sub-orig ${sub.original ? "" : "dim"}">${sub.original ? escapeHtml(sub.original) : "（空）"}</div>
-      ${sub.translated ? `<div class="sub-trans">${escapeHtml(sub.translated)}</div>` : ""}
+      ${sub.translated ? `<div class="sub-trans">${escapeHtml(sub.translated)}</div>` : '<div class="sub-trans dim">（未翻译，双击输入）</div>'}
     </div>
     <div class="sub-actions">
       <button class="mini-btn" data-act="retr" title="用当前引擎重新翻译本条">🔄</button>
@@ -841,8 +854,10 @@ function buildRow(sub, idx) {
     $("#video").currentTime = sub.start;
   });
   row.addEventListener("dblclick", (e) => {
-    if (e.target.classList.contains("sub-orig")) startEdit(idx, "original");
-    else if (e.target.classList.contains("sub-trans")) startEdit(idx, "translated");
+    // 双击命中文字区域即可编辑；点译文编辑译文，否则编辑原文
+    if (e.target.closest(".sub-actions") || e.target.closest(".sub-time")) return;
+    if (e.target.closest(".sub-trans")) startEdit(idx, "translated");
+    else startEdit(idx, "original");
   });
   row.querySelector(".sub-time").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -934,6 +949,7 @@ function undo() {
   redoStack.push(snapshotSubs());
   const prev = undoStack.pop();
   lastSnapshot = prev;
+  invalidateLoop();
   restoreSnapshot(prev);
   $("#runMsg").textContent = "已撤销";
 }
@@ -943,6 +959,7 @@ function redo() {
   undoStack.push(snapshotSubs());
   const next = redoStack.pop();
   lastSnapshot = next;
+  invalidateLoop();
   restoreSnapshot(next);
   $("#runMsg").textContent = "已重做";
 }
@@ -964,7 +981,9 @@ function commitInlineEdit() {
   const text = textarea.value.trim();
   const div = document.createElement("div");
   div.className = field === "original" ? "sub-orig" : "sub-trans";
-  div.textContent = text || "（空）";
+  const placeholder = field === "original" ? "（空）" : "（未翻译，双击输入）";
+  div.textContent = text || placeholder;
+  if (!text) div.classList.add("dim");
   // 行可能因列表重建已脱离 DOM（编辑中途来了新分片）：直接提交到对象并整表刷新
   const detached = !textarea.isConnected;
   textarea.replaceWith(div);
@@ -1064,9 +1083,11 @@ function deleteSubtitle(idx) {
   commitInlineEdit();
   if (!state.subtitles[idx]) return;
   pushUndo();
+  invalidateLoop();
   state.subtitles.splice(idx, 1);
   markDirty();
   refreshSubList();
+  $("#runMsg").textContent = "已删除字幕（Ctrl+Z 撤销）";
 }
 
 function mergeWithNext(idx) {
@@ -1075,6 +1096,7 @@ function mergeWithNext(idx) {
   const b = state.subtitles[idx + 1];
   if (!a || !b) return;
   pushUndo();
+  invalidateLoop();
   // 用 max 防后一条完全包在前一条内时时长回缩
   a.end = Math.max(a.end, b.end);
   a.original = [a.original, b.original].filter(Boolean).join("\n");
@@ -1089,6 +1111,7 @@ function splitSubtitle(idx) {
   const s = state.subtitles[idx];
   if (!s || s.end - s.start < 0.4) return;
   pushUndo();
+  invalidateLoop();
   const mid = (s.start + s.end) / 2;
   // 按码点切分：直接按 UTF-16 长度切会截断 emoji 等代理对
   const orig = Array.from(s.original);
@@ -1113,10 +1136,22 @@ function splitSubtitle(idx) {
 }
 
 // ── 循环播放当前字幕 ──
+function invalidateLoop() {
+  const v = $("#video");
+  if (v.dataset.loopIdx == null) return;
+  delete v.dataset.loopIdx;
+  delete v.dataset.loopStart;
+  delete v.dataset.loopEnd;
+  $("#runMsg").textContent = "循环播放已停止（字幕结构已变化）";
+}
+
 function toggleLoopCurrent() {
   const v = $("#video");
   const i = currentSubIndex();
-  if (i < 0) return;
+  if (i < 0) {
+    $("#runMsg").textContent = "当前没有播放中的字幕，先播放到某条字幕再按 R";
+    return;
+  }
   const s = state.subtitles[i];
   if (v.dataset.loopIdx === String(i)) {
     delete v.dataset.loopIdx;
@@ -1160,8 +1195,13 @@ function updateOverlay(t) {
   const showTrans = $("#showTrans").checked;
   if (!cur) return overlay.classList.add("hidden");
   let html = "";
-  if (showOrig && cur.original) html += `<div class="ol-orig">${escapeHtml(cur.original)}</div>`;
-  if (showTrans && cur.translated) html += `<div class="ol-trans">${escapeHtml(cur.translated)}</div>`;
+  const spk = cur.speaker ? `【${escapeHtml(cur.speaker)}】` : "";
+  if (showOrig && cur.original) html += `<div class="ol-orig">${spk}${escapeHtml(cur.original)}</div>`;
+  if (showTrans && cur.translated) {
+    // 说话人前缀只出现一次：有原文行时在原文行，否则在译文行
+    const transSpk = !showOrig || !cur.original ? spk : "";
+    html += `<div class="ol-trans">${transSpk}${escapeHtml(cur.translated)}</div>`;
+  }
   if (html) {
     overlay.innerHTML = html;
     overlay.classList.remove("hidden");
@@ -1254,8 +1294,8 @@ function seekWaveform(e) {
   const dur = $("#video").duration;
   if (!dur) return;
   const rect = wrap.getBoundingClientRect();
-  const frac = (e.clientX - rect.left) / Math.max(1, rect.width);
-  $("#video").currentTime = Math.max(0, Math.min(dur, frac * dur));
+  const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+  $("#video").currentTime = frac * dur;
   drawWaveform();
 }
 
@@ -1671,6 +1711,7 @@ async function importSubtitleFile(replace) {
       return;
     }
     pushUndo();
+    invalidateLoop();
     if (replace) state.subtitles = [];
     const mapped = subs.map((s) => ({
       index: 0,
@@ -1703,6 +1744,7 @@ function applyShift() {
   }
   const delta = ms / 1000;
   pushUndo();
+  invalidateLoop();
   let n = 0;
   for (const s of state.subtitles) {
     const dur = s.end - s.start;
@@ -1730,6 +1772,7 @@ function applyFps() {
   }
   const ratio = from / to;
   pushUndo();
+  invalidateLoop();
   let n = 0;
   for (const s of state.subtitles) {
     s.start *= ratio;
@@ -1757,6 +1800,7 @@ function applyReplace() {
     return;
   }
   pushUndo();
+  invalidateLoop();
   let hits = 0;
   for (const s of state.subtitles) {
     if (s.original.includes(find)) {
@@ -1915,6 +1959,8 @@ function checkSubtitles() {
       if (!sub) return;
       $("#video").currentTime = sub.start;
       $("#subsDrawer").classList.remove("hidden");
+      // 收起设置浮层，让用户立刻看到定位的画面
+      $("#settingsOverlay").classList.add("hidden");
     });
     el.appendChild(d);
   }
@@ -1932,6 +1978,7 @@ function fixOverlaps() {
   }
   // 快照必须在修改前推入
   pushUndo();
+  invalidateLoop();
   let fixed = 0;
   for (let i = 1; i < state.subtitles.length; i++) {
     const s = state.subtitles[i];
@@ -2269,10 +2316,23 @@ boot();
 {
   const overlay = $("#settingsOverlay");
   const drawer = $("#subsDrawer");
-  const openSettings = () => overlay.classList.remove("hidden");
-  const closeSettings = () => overlay.classList.add("hidden");
-  const openDrawer = () => drawer.classList.remove("hidden");
-  const closeDrawer = () => drawer.classList.add("hidden");
+  // 焦点管理：打开浮层时焦点移入（关闭按钮），关闭时还给触发按钮，Tab 不再掉到背景控件
+  const openSettings = () => {
+    overlay.classList.remove("hidden");
+    $("#settingsClose").focus();
+  };
+  const closeSettings = () => {
+    overlay.classList.add("hidden");
+    $("#settingsBtn").focus();
+  };
+  const openDrawer = () => {
+    drawer.classList.remove("hidden");
+    $("#subsClose").focus();
+  };
+  const closeDrawer = () => {
+    drawer.classList.add("hidden");
+    $("#subsBtn").focus();
+  };
 
   $("#settingsBtn").addEventListener("click", openSettings);
   $("#settingsClose").addEventListener("click", closeSettings);

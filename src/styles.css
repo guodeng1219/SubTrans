@@ -317,7 +317,7 @@ select:focus, input:focus, textarea:focus { outline: none; border-color: var(--g
 
 /* ═══════════ 字幕抽屉（左缘滑出） ═══════════ */
 .drawer {
-  position: absolute; top: 78px; bottom: 116px; left: 14px;
+  position: absolute; top: 78px; bottom: 172px; left: 14px;
   width: min(400px, 42vw);
   z-index: 30;
   display: flex; flex-direction: column;
@@ -387,9 +387,9 @@ select:focus, input:focus, textarea:focus { outline: none; border-color: var(--g
   color: var(--text); font: inherit; font-size: 13px;
   padding: 6px 8px; outline: none;
 }
-.time-edit { display: inline-flex; flex-direction: column; gap: 3px; min-width: 62px; }
+.time-edit { display: inline-flex; flex-direction: column; gap: 3px; min-width: 72px; }
 .time-input {
-  width: 62px; padding: 2px 4px;
+  width: 72px; padding: 2px 4px;
   font-family: var(--mono); font-size: 10px;
   background: rgba(8, 10, 14, 0.85);
   border: 1px solid var(--gold); border-radius: 5px;
