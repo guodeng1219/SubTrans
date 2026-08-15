@@ -899,12 +899,22 @@ async fn process_chunk_inner(
         };
         let vad_str = vad_path.as_ref().map(|p| p.to_string_lossy().to_string());
         let lang = src_owned.clone();
-        tokio::task::spawn_blocking(move || {
-            eng.transcribe(&audio, lang.as_deref(), threads, offset, vad_str.as_deref())
+        // options 持有 &str 借用，必须在闭包内用 owned 值构造以满足 spawn_blocking 的 'static 要求
+        let transcription = tokio::task::spawn_blocking(move || {
+            let options = asr::TranscribeOptions {
+                language: lang.as_deref(),
+                initial_prompt: None, // Task 4 接入语言预设后填充
+                threads,
+                time_offset_sec: offset,
+                vad_model_path: vad_str.as_deref(),
+                best_of: 5,
+            };
+            eng.transcribe(&audio, options)
         })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        transcription.segments
     };
     let transcribe_ms = t_tr.elapsed().as_millis() as u64;
 

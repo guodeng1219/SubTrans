@@ -224,23 +224,38 @@ pub trait AsrEngine: Send + Sync {
     where
         Self: Sized;
 
-    /// 转写 f32 音频 → 字幕片段。time_offset_sec 将分片局部时间戳映射为视频绝对时间。
-    /// vad_model_path: 传入 Silero VAD 模型路径则启用 VAD 过滤静音段，减少幻觉。
-    fn transcribe(
-        &self,
-        audio: &[f32],
-        language: Option<&str>,
-        threads: i32,
-        time_offset_sec: f64,
-        vad_model_path: Option<&str>,
-    ) -> Result<Vec<Segment>>;
+    /// 转写 f32 音频 → 结构化结果（字幕段 + 检测语言）。
+    /// 语言、提示词、VAD 与解码参数统一由 [`TranscribeOptions`] 携带。
+    fn transcribe(&self, audio: &[f32], options: TranscribeOptions<'_>) -> Result<Transcription>;
+}
+
+/// ASR 转写的结构化输入：把语言、提示词、解码参数打包，避免两条链路参数漂移。
+pub struct TranscribeOptions<'a> {
+    /// 强制语言（None = 自动检测）。
+    pub language: Option<&'a str>,
+    /// 预设/滚动上下文合成的初始提示词（None 或空串 = 不注入）。
+    pub initial_prompt: Option<&'a str>,
+    pub threads: i32,
+    /// 分片局部时间戳 → 视频绝对时间的偏移秒数。
+    pub time_offset_sec: f64,
+    /// Silero VAD 模型路径（None = 不启用 VAD）。
+    pub vad_model_path: Option<&'a str>,
+    /// Greedy 采样候选数。
+    pub best_of: i32,
+}
+
+/// ASR 转写的结构化输出：字幕段 + 检测语言。
+/// 手动指定语言时回传该语言；自动检测时回传 whisper 判定结果。
+pub struct Transcription {
+    pub segments: Vec<Segment>,
+    pub detected_lang: Option<String>,
 }
 
 pub mod whisper;
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_fillers, split_long_segments, Segment};
+    use super::{clean_fillers, split_long_segments, Segment, TranscribeOptions, Transcription};
 
     #[test]
     fn fillers_at_start_leave_no_leading_punctuation() {
@@ -372,5 +387,28 @@ mod tests {
         for s in &segs {
             assert!(s.end > s.start, "零时长字幕: {s:?}");
         }
+    }
+
+    #[test]
+    fn transcription_carries_detected_language() {
+        let result = Transcription {
+            segments: Vec::new(),
+            detected_lang: Some("en".to_string()),
+        };
+        assert_eq!(result.detected_lang.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn transcribe_options_keep_prompt_and_decode_values() {
+        let options = TranscribeOptions {
+            language: Some("en"),
+            initial_prompt: Some("British film dialogue"),
+            threads: 4,
+            time_offset_sec: 10.0,
+            vad_model_path: None,
+            best_of: 5,
+        };
+        assert_eq!(options.initial_prompt, Some("British film dialogue"));
+        assert_eq!(options.best_of, 5);
     }
 }
