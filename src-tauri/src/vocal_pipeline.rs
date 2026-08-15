@@ -45,9 +45,9 @@ impl VocalState {
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// 取消当前任务：换代与删除旧发布在**同一锁临界区**内原子完成——
-    /// 旧 begin/cancel 不可能在「换代之后、删除之前」被新任务抢占，
-    /// 从而绝不会误删新任务刚发布的人声轨。
+    /// 取消当前任务：换代与删除旧发布在**同一锁临界区**内原子完成，
+    /// 与 `publish_output` 线性化——取消要么发生在发布前（发布方令牌过期、自行删除），
+    /// 要么发生在发布后（本函数删除），不会留下"已发布但会话已废弃"的文件。
     pub fn cancel(&self) {
         let mut guard = self.published_output.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
