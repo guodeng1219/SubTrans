@@ -51,7 +51,7 @@ jobs:
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: Rust 质量检查 (clippy)
-        run: cargo clippy --no-deps -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
         working-directory: src-tauri
 
       - name: Rust 测试
@@ -64,7 +64,14 @@ jobs:
           npm run test:frontend
 
       # Python 协议测试：fw/vocal 服务 + demucs 启动屏障（含 argv 重组回归测试）。
-      # 参数错位这类问题必须在发布前被抓住，而不是进入安装包
+      # 参数错位这类问题必须在发布前被抓住，而不是进入安装包。
+      # Windows runner 镜像已不再自带 PATH 上的 python（windows-2022 起），
+      # 必须显式安装解释器，否则 Windows 腿会以 command not found 失败
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Python 协议测试
         shell: bash
         run: |
