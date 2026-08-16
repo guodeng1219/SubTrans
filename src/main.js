@@ -28,9 +28,10 @@ const state = {
 
 // 用户是否手动改选过人声分离模型：改选后 detectEnv 不再自动覆盖默认引擎
 let demucsModelChosen = false;
-// 接受"separate"进度事件的会话令牌：旧分离任务的残留进度（demucs 后台
-// 读行任务等）不得覆盖新任务的状态；任务结束后清空
-let sepSession = null;
+// 当前分离任务的 request_id：后端所有 separate 进度事件携带它，
+// 前端只接受与该 id 匹配的事件——旧任务（如 Demucs 后台读行任务）
+// 的残留进度绝不会覆盖新任务的状态；任务结束后清空
+let sepTaskId = null;
 
 // 边播边译的流水线状态
 const stream = {
@@ -173,9 +174,9 @@ listen("progress", (e) => {
     const st = $("#pyStatus");
     if (st) st.textContent = message;
   } else if (stage === "separate") {
-    // 分离进度必须属于当前任务：旧任务取消后残留的输出（如 demucs 后台
-    // 读行任务）不得覆盖新会话的进度与文案
-    if (state.session !== sepSession) return;
+    // 分离进度必须属于当前任务：按 request_id 严格匹配，旧任务残留的
+    // stdout 事件（如取消后的 Demucs 后台读行）直接丢弃
+    if (!sepTaskId || e.payload?.task_id !== sepTaskId) return;
     setFill("#runFill", pct);
     if (e.payload?.chunk_total != null) {
       $("#runMsg").textContent = formatVocalProgress(e.payload);
@@ -978,8 +979,10 @@ async function startProcess() {
 
   // 高精度模式：先用 demucs 分离人声，ASR 改用纯人声轨（播放仍用原视频）
   if ($("#hiQuality").checked) {
-    // 记录本次分离任务的会话令牌：后端进度事件只在本会话内被接受
-    sepSession = sessionAtProc;
+    // 为本次任务生成唯一 request_id：后端所有 separate 进度事件携带它，
+    // 前端只接受匹配事件（旧任务残留输出按 id 丢弃，不靠会话猜测）
+    const taskId = `sep-${sessionAtProc}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    sepTaskId = taskId;
     $("#runMsg").textContent = "高精度模式：分离人声中（首次会加载模型，请稍候）...";
     try {
       const vocals = await invoke("separate_vocals", {
@@ -987,6 +990,7 @@ async function startProcess() {
         pythonExe: $("#pyPython").value.trim(), // 探测/用户填写的 Python；留空才回退 bundled
         model: $("#demucsModel").value,
         device: $("#demucsDevice").value,
+        taskId,
       });
       // 分离期间会话可能已切换：过期结果/错误都不得触碰新会话状态
       if (state.session !== sessionAtProc) return;
@@ -1006,9 +1010,9 @@ async function startProcess() {
       $("#demucsStatus").style.color = "var(--danger)";
       return;
     } finally {
-      // 本任务结束：同会话的后续分离进度不再可信（demucs 后台读行任务
-      // 的残留输出不得覆盖识别阶段的文案）
-      if (sepSession === sessionAtProc) sepSession = null;
+      // 本任务结束：后续同 id 的分离进度不再可信（Demucs 后台读行任务的
+      // 残留输出不得覆盖识别阶段的文案）；新任务会先设置自己的 id
+      if (sepTaskId === taskId) sepTaskId = null;
     }
   }
 

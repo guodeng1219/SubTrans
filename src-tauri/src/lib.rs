@@ -340,12 +340,15 @@ pub(crate) struct VocalProgressFields {
 }
 
 /// 进度事件：原有 `stage/pct/message` 保持不变，人声分离专用字段可选，
-/// 旧事件不携带时前端按原样处理。
+/// 旧事件不携带时前端按原样处理。`task_id` 用于把分离进度绑定到具体任务：
+/// 前端只接受与当前任务匹配的事件，旧任务残留输出不会覆盖新任务状态。
 #[derive(Serialize, Clone)]
 struct ProgressEvent {
     stage: String,
     pct: f64,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -369,6 +372,7 @@ impl ProgressEvent {
             stage: stage.to_string(),
             pct,
             message: message.to_string(),
+            task_id: None,
             chunk_index: None,
             chunk_total: None,
             memory_bytes: None,
@@ -379,12 +383,13 @@ impl ProgressEvent {
         }
     }
 
-    /// 人声分离结构化事件（stage 固定为 "separate"）。
-    fn vocal(pct: f64, message: &str, fields: VocalProgressFields) -> Self {
+    /// 人声分离结构化事件（stage 固定为 "separate"），携带任务归属 id。
+    fn vocal(pct: f64, message: &str, fields: VocalProgressFields, task_id: &str) -> Self {
         Self {
             stage: "separate".to_string(),
             pct,
             message: message.to_string(),
+            task_id: Some(task_id.to_string()),
             chunk_index: Some(fields.chunk_index),
             chunk_total: Some(fields.chunk_total),
             memory_bytes: Some(fields.memory_bytes),
@@ -400,14 +405,29 @@ pub(crate) fn emit_progress(app: &tauri::AppHandle, stage: &str, pct: f64, messa
     let _ = app.emit("progress", ProgressEvent::legacy(stage, pct, message));
 }
 
+/// 带任务归属的进度事件：分离任务的每个事件都携带 request_id，
+/// 前端据此丢弃过期任务的残留进度（如旧 Demucs 后台读行输出）。
+pub(crate) fn emit_progress_task(
+    app: &tauri::AppHandle,
+    stage: &str,
+    pct: f64,
+    message: &str,
+    task_id: &str,
+) {
+    let mut event = ProgressEvent::legacy(stage, pct, message);
+    event.task_id = Some(task_id.to_string());
+    let _ = app.emit("progress", event);
+}
+
 /// 人声分离结构化进度：携带分片序号与内存字段，前端据此展示内存占用与降片重试。
 pub(crate) fn emit_vocal_progress(
     app: &tauri::AppHandle,
     pct: f64,
     message: &str,
     fields: VocalProgressFields,
+    task_id: &str,
 ) {
-    let _ = app.emit("progress", ProgressEvent::vocal(pct, message, fields));
+    let _ = app.emit("progress", ProgressEvent::vocal(pct, message, fields, task_id));
 }
 
 /// 把失败日志同时输出到控制台（dev 终端的 stderr）和日志文件
@@ -1559,7 +1579,8 @@ async fn demucs_check(app: tauri::AppHandle, python_exe: String) -> Result<Strin
 }
 
 /// 用 audio-separator（BS-RoFormer）或 demucs 把整段音频分离出纯人声轨，返回 vocals.wav 路径。
-/// 优先使用 audio-separator（分离质量更高），不可用时回退 demucs。
+/// `task_id` 是前端为本次任务生成的请求 id：所有 separate 进度事件携带它，
+/// 前端据此丢弃过期任务（如旧 Demucs 后台读行任务）的残留进度。
 #[tauri::command]
 async fn separate_vocals(
     app: tauri::AppHandle,
@@ -1567,8 +1588,11 @@ async fn separate_vocals(
     python_exe: String,
     model: String,
     device: String,
+    task_id: Option<String>,
 ) -> Result<String, String> {
-    let res = separate_vocals_inner(app.clone(), video_path, python_exe, model, device).await;
+    let task_id = task_id.unwrap_or_default();
+    let res =
+        separate_vocals_inner(app.clone(), video_path, python_exe, model, device, &task_id).await;
     if let Err(e) = &res {
         log_err(&app, "separate_vocals", e);
     }
@@ -1581,6 +1605,7 @@ async fn separate_vocals_inner(
     python_exe: String,
     model: String,
     device: String,
+    task_id: &str,
 ) -> Result<String, String> {
     let python_exe = if python_exe.is_empty() { resolve_python(&app) } else { python_exe };
 
@@ -1608,17 +1633,16 @@ async fn separate_vocals_inner(
         return Err(fail("vocal_worker_start_failed", e));
     }
 
-    // 每次分离用独立目录（带 PID + 时间戳），避免多实例/并发互相删目录；
-    // 结束后把 vocals 复制到稳定路径，再清掉工作目录。
+    // 每次分离用独立目录（PID + 任务令牌 + 时间戳）：令牌单调递增，
+    // 即使同进程两个请求落在同一毫秒也不会共用工作目录/输出路径。
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     // 清理人声轨残留：本进程旧文件立即清；其它进程（上次运行）遗留的只清 24h 以上陈旧的，
     // 避免误删另一个正在运行实例正在使用的文件。
-    // 处于发布状态的文件必须跳过：新任务预检失败时应保留旧会话的输出，
-    // 不能先删文件再让 published_output 指向已不存在的路径。
-    let published = vocal_state.published_path();
+    // 删除决策在 VocalState 的发布锁内完成：并发任务恰好在清扫期间发布的新文件
+    // 不会被当成「本进程旧文件」误删（每次删除前重新校验当前发布路径）。
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
         for entry in entries.flatten() {
@@ -1626,25 +1650,31 @@ async fn separate_vocals_inner(
             if !name.starts_with("subtrans_vocals_") || !name.ends_with(".wav") {
                 continue;
             }
-            if published.as_ref() == Some(&entry.path()) {
-                continue;
-            }
             let is_ours = name.starts_with(&format!("subtrans_vocals_{}_", std::process::id()));
             let stale =
                 entry.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false);
             if is_ours || stale {
-                let _ = std::fs::remove_file(entry.path());
+                vocal_state.sweep_candidate(&entry.path());
             }
         }
     }
-    let work = std::env::temp_dir().join(format!("subtrans_sep_{}_{}", std::process::id(), stamp));
+    let work = std::env::temp_dir().join(format!(
+        "subtrans_sep_{}_{}_{}",
+        std::process::id(),
+        token,
+        stamp
+    ));
     std::fs::create_dir_all(&work)
         .map_err(|e| fail("vocal_worker_start_failed", format!("创建工作目录失败: {e}")))?;
     // 工作目录含整段视频的音频（可达 GB 级），由守护对象统一清理：
     // 提取失败 / 分离失败 / 超时 / 成功等所有路径都不在 temp 里堆积大文件。
     let _work_guard = TempDirGuard(work.clone());
-    let vocals_dest =
-        std::env::temp_dir().join(format!("subtrans_vocals_{}_{}.wav", std::process::id(), stamp));
+    let vocals_dest = std::env::temp_dir().join(format!(
+        "subtrans_vocals_{}_{}_{}.wav",
+        std::process::id(),
+        token,
+        stamp
+    ));
 
     let ffmpeg_bin = resolve_ffmpeg(&app);
 
@@ -1675,6 +1705,8 @@ async fn separate_vocals_inner(
             &app,
             vocal_state.inner(),
             token,
+            task_id,
+            &logger,
             &video_path,
             &python_exe,
             &demucs_model,
@@ -1700,7 +1732,7 @@ async fn separate_vocals_inner(
                 }
                 // 100% 只在发布成功后展示：取消恰好在复制与发布之间时，
                 // 进度条不会出现「100% 完成」与「任务已取消」的矛盾终态
-                emit_progress(&app, "separate", 100.0, "人声分离完成");
+                emit_progress_task(&app, "separate", 100.0, "人声分离完成", task_id);
                 let _ = logger
                     .write("task_done", &serde_json::json!({"engine": "demucs", "output": path}));
             }
@@ -1753,6 +1785,7 @@ async fn separate_vocals_inner(
         model_dir: &sep_models_dir,
         work_dir: &work,
         stable_output: &vocals_dest,
+        task_id,
     };
     // 整体 2 小时兜底：超时则换代取消（清理 worker 与已发布输出）。
     // 成功/失败/超时三态都写入任务日志终态，内存或 worker 问题后日志可定位最终失败码。
@@ -1799,7 +1832,7 @@ async fn separate_vocals_inner(
             "retried_with_smaller_chunks": result.retried_with_smaller_chunks,
         }),
     );
-    emit_progress(&app, "separate", 100.0, "人声分离完成");
+    emit_progress_task(&app, "separate", 100.0, "人声分离完成", task_id);
     Ok(result.output_path.to_string_lossy().to_string())
 }
 
@@ -1819,11 +1852,15 @@ fn demucs_error_code(message: &str) -> &'static str {
 /// demucs 明确选择路径：整片提取 + demucs 分离。
 /// 与 BS-RoFormer 管线同级防护：任务令牌可取消、Job Object 内存硬限、
 /// 内存采样（超限即杀整树）、2 小时死线——不再是无保护的裸跑。
+/// 内存现场（warn/exceeded/峰值/预算/Job 峰值）全部写入任务日志，
+/// 复现 30–40GB 占用问题时日志足以还原现场。
 #[allow(clippy::too_many_arguments)] // 与上层命令参数一一对应
 async fn separate_demucs(
     app: &tauri::AppHandle,
     state: &vocal_pipeline::VocalState,
     token: u64,
+    task_id: &str,
+    logger: &task_log::TaskLogger,
     video_path: &str,
     python_exe: &str,
     demucs_model: &str,
@@ -1840,7 +1877,7 @@ async fn separate_demucs(
 
     let audio = work.join("audio.wav");
     // 1) 提取整段音频（44.1k 立体声）——可取消 + 超时即杀
-    emit_progress(app, "separate", 3.0, "提取音频中...");
+    emit_progress_task(app, "separate", 3.0, "提取音频中...", task_id);
     vocal_pipeline::run_cancellable(
         state,
         token,
@@ -1854,11 +1891,12 @@ async fn separate_demucs(
     let out_dir = work.join("out");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
 
-    emit_progress(
+    emit_progress_task(
         app,
         "separate",
         8.0,
         &format!("分离人声中（demucs {demucs_model}, {device}）..."),
+        task_id,
     );
     // 启动屏障：与 BS-RoFormer worker 相同的 load 协议。包装脚本在收到
     // {"op":"load"} 之前绝不导入 demucs / 加载模型，因此「Job 绑定先于
@@ -1916,7 +1954,7 @@ async fn separate_demucs(
         }
     } // stdin 句柄在此关闭：屏障脚本已消费 load 行，demucs main() 不读 stdin
 
-    // 读取 stdout+stderr 实时转发进度
+    // 读取 stdout+stderr 实时转发进度（事件携带任务归属 id，前端按 id 丢弃过期任务）
     let tail = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
     let mut readers = Vec::new();
     for pipe in [
@@ -1928,6 +1966,7 @@ async fn separate_demucs(
     {
         let app2 = app.clone();
         let tail2 = tail.clone();
+        let task_id2 = task_id.to_string();
         readers.push(tokio::spawn(async move {
             let mut lines = BufReader::new(pipe).lines();
             loop {
@@ -1938,7 +1977,13 @@ async fn separate_demucs(
                 };
                 let line = line.trim().to_string();
                 if !line.is_empty() {
-                    emit_progress(&app2, "separate", 50.0, &format!("分离中: {line}"));
+                    emit_progress_task(
+                        &app2,
+                        "separate",
+                        50.0,
+                        &format!("分离中: {line}"),
+                        &task_id2,
+                    );
                     let mut t = tail2.lock().unwrap();
                     t.push_back(line);
                     while t.len() > 8 {
@@ -1953,6 +1998,7 @@ async fn separate_demucs(
     // 定时器必须在循环外创建（interval）：500ms 分支总是先完成，循环内重建的
     // 2 秒定时器永远到不了，内存采样就会整套失效。超限/取消/超时都先终止
     // 整棵进程树（Job），绝不留下可叠加内存的孤儿进程。
+    // 内存现场完整入库：warn / exceeded / 终止时的峰值与预算，复现问题可还原。
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
     let wait_future = child.wait();
     tokio::pin!(wait_future);
@@ -1960,34 +2006,66 @@ async fn separate_demucs(
     memory_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cancel_tick = tokio::time::interval(CANCEL_TICK);
     cancel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let write_summary = |phase: &str, peak: u64| {
+        let _ = logger.write(
+            "demucs_memory_summary",
+            &serde_json::json!({
+                "phase": phase,
+                "peak_private_bytes": peak,
+                "budget_bytes": budget,
+                "job_peak_bytes": job.peak_job_memory_bytes().ok(),
+            }),
+        );
+    };
     let status = loop {
         tokio::select! {
             r = &mut wait_future => break r,
             _ = memory_tick.tick() => {
                 if let Ok(sample) = probe.sample() {
-                    if memory_guard.observe(sample)
-                        == crate::process_memory::MemoryDecision::Exceeded
-                    {
-                        job.terminate(1);
-                        return Err(
-                            "人声分离内存超限（已终止进程树）：请改用 BS-RoFormer（有界分片）或 GPU"
-                                .to_string(),
-                        );
+                    match memory_guard.observe(sample) {
+                        crate::process_memory::MemoryDecision::Warn => {
+                            let _ = logger.write(
+                                "memory_warn",
+                                &serde_json::json!({
+                                    "engine": "demucs",
+                                    "budget_bytes": budget,
+                                    "working_set_bytes": sample.working_set_bytes,
+                                    "private_bytes": sample.private_bytes,
+                                }),
+                            );
+                        }
+                        crate::process_memory::MemoryDecision::Exceeded => {
+                            let _ = logger.write(
+                                "memory_exceeded",
+                                &serde_json::json!({"engine": "demucs", "budget_bytes": budget}),
+                            );
+                            job.terminate(1);
+                            write_summary("memory_exceeded", memory_guard.peak_private_bytes());
+                            return Err(
+                                "人声分离内存超限（已终止进程树）：请改用 BS-RoFormer（有界分片）或 GPU"
+                                    .to_string(),
+                            );
+                        }
+                        crate::process_memory::MemoryDecision::Continue => {}
                     }
                 }
             }
             _ = cancel_tick.tick() => {
                 if state.is_cancelled(token) {
                     job.terminate(1);
+                    write_summary("cancelled", memory_guard.peak_private_bytes());
                     return Err("任务已取消".to_string());
                 }
                 if tokio::time::Instant::now() >= deadline {
                     job.terminate(1);
+                    write_summary("timeout", memory_guard.peak_private_bytes());
                     return Err("人声分离超时（2 小时），已终止进程".to_string());
                 }
             }
         }
     };
+    // Python 阶段终止：无论后续成败，内存峰值/预算/Job 峰值已入库
+    write_summary("python_finished", memory_guard.peak_private_bytes());
     let status = status.map_err(|e| e.to_string())?;
     for r in readers {
         let _ = r.await;
@@ -2976,6 +3054,7 @@ mod tests {
         let event = ProgressEvent::legacy("download_model", 10.0, "loading");
         let value = serde_json::to_value(event).unwrap();
         assert!(value.get("chunk_index").is_none());
+        assert!(value.get("task_id").is_none());
     }
 
     #[test]
@@ -2992,7 +3071,10 @@ mod tests {
                 retrying_with_smaller_chunks: false,
                 warning: false,
             },
+            "sep-1",
         );
-        assert_eq!(serde_json::to_value(event).unwrap()["chunk_index"], 7);
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["chunk_index"], 7);
+        assert_eq!(value["task_id"], "sep-1");
     }
 }

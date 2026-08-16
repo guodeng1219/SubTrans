@@ -63,9 +63,15 @@ impl VocalState {
         self.generation.load(Ordering::SeqCst) != token
     }
 
-    /// 当前发布的人声轨路径（用于清扫/校验时跳过仍处于发布状态的文件）。
-    pub fn published_path(&self) -> Option<PathBuf> {
-        self.published_output.lock().unwrap().clone()
+    /// 在发布锁内删除候选残留文件：仅当它不是当前发布路径时删除。
+    /// 与 `publish_output` 的「校验 + 替换」线性化——并发任务恰好在清扫期间
+    /// 发布的新文件绝不会被当作「本进程旧文件」误删（删除决策与发布互斥）。
+    pub fn sweep_candidate(&self, path: &Path) {
+        let guard = self.published_output.lock().unwrap();
+        let is_published = guard.as_ref().is_some_and(|p| p == path);
+        if !is_published {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// 发布最终人声轨路径：令牌检查与替换发布在**同一把锁内**原子完成——
@@ -171,6 +177,8 @@ pub struct VocalPipelineConfig<'a> {
     pub model_dir: &'a Path,
     pub work_dir: &'a Path,
     pub stable_output: &'a Path,
+    /// 前端生成的任务归属 id：所有 separate 进度事件携带，前端按 id 丢弃过期任务
+    pub task_id: &'a str,
 }
 
 pub struct VocalPipelineResult {
@@ -222,8 +230,50 @@ impl WorkerCtx {
         // Job 绑定失败：pending 随作用域 Drop（kill_on_drop 杀子进程 + 清理临时脚本）
         let job = JobGuard::assign(pid, budget)
             .map_err(|e| VocalPipelineError::new("vocal_worker_start_failed", e))?;
-        let memory_guard = MemoryGuard::new(budget);
-        let worker = pending.wait_ready(state, token).await.map_err(|e| {
+        let mut memory_guard = MemoryGuard::new(budget);
+        // 模型加载阶段同样软采样：非 Windows 平台没有 Job 硬限，加载期的内存尖峰
+        // 必须同样被 85% 警告 / 100% 终止捕获。wait_ready future 只 pin 一次，
+        // 内存采样用循环外 interval（与单片分离同款防失效模式）。
+        let ready = pending.wait_ready(state, token);
+        tokio::pin!(ready);
+        let mut load_memory_tick = tokio::time::interval(MEMORY_TICK);
+        load_memory_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let worker = loop {
+            tokio::select! {
+                r = &mut ready => break r,
+                _ = load_memory_tick.tick() => {
+                    if let Ok(sample) = probe.sample() {
+                        match memory_guard.observe(sample) {
+                            MemoryDecision::Warn => {
+                                let _ = logger.write(
+                                    "memory_warn",
+                                    &serde_json::json!({
+                                        "phase": "model_load",
+                                        "budget_bytes": budget,
+                                        "working_set_bytes": sample.working_set_bytes,
+                                        "private_bytes": sample.private_bytes,
+                                    }),
+                                );
+                            }
+                            MemoryDecision::Exceeded => {
+                                let _ = logger.write(
+                                    "memory_exceeded",
+                                    &serde_json::json!({"phase": "model_load", "budget_bytes": budget}),
+                                );
+                                // 整树终止；ready future 随返回 drop（kill_on_drop + Drop 清理脚本）
+                                job.terminate(1);
+                                return Err(VocalPipelineError::new(
+                                    "vocal_memory_limit_exceeded",
+                                    "模型加载阶段内存超限：请尝试 GPU 或关闭高精度模式",
+                                ));
+                            }
+                            MemoryDecision::Continue => {}
+                        }
+                    }
+                }
+            }
+        };
+        let worker = worker.map_err(|e| {
             let code = if e.contains("vocal_model_unavailable") {
                 "vocal_model_unavailable"
             } else if e.contains("任务已取消") {
@@ -280,10 +330,11 @@ where
     }
 }
 
-/// 进度封装：pct 按已完成核心帧数计算。
+/// 进度封装：pct 按已完成核心帧数计算；事件携带任务归属 id。
 #[allow(clippy::too_many_arguments)] // 分片进度展示所需的完整上下文
 fn emit_chunk_progress(
     app: &tauri::AppHandle,
+    task_id: &str,
     done: usize,
     total: usize,
     completed_frames: u64,
@@ -314,6 +365,7 @@ fn emit_chunk_progress(
             retrying_with_smaller_chunks: retrying,
             warning,
         },
+        task_id,
     );
 }
 
@@ -410,6 +462,7 @@ async fn process_one_chunk(
                                     );
                                     emit_chunk_progress(
                                         app,
+                                        config.task_id,
                                         global_index,
                                         chunk_total,
                                         completed_frames,
@@ -619,6 +672,7 @@ pub async fn run_bounded_vocal_pipeline(
                     chunk_count += 1;
                     emit_chunk_progress(
                         app,
+                        config.task_id,
                         chunk_count.saturating_sub(1),
                         chunk_total_display,
                         attempt.completed_until_frame,
@@ -683,6 +737,7 @@ pub async fn run_bounded_vocal_pipeline(
                         retrying_with_smaller_chunks: true,
                         warning: true,
                     },
+                    config.task_id,
                 );
                 plan = next;
             }
