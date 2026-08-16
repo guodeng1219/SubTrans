@@ -27,10 +27,11 @@ def wait_for_load(stdin):
 
 
 def main():
-    if len(sys.argv) < 6:
+    # argv = [script, model, device, out_dir, audio]，共 5 个元素
+    if len(sys.argv) < 5:
         print("usage: demucs_barrier.py <model> <device> <out_dir> <audio>", file=sys.stderr)
         sys.exit(2)
-    model, device, out_dir, audio = sys.argv[2:6]
+    model, device, out_dir, audio = sys.argv[1:5]
     if not wait_for_load(sys.stdin):
         print('expected {"op": "load"} before model load', file=sys.stderr)
         sys.exit(2)

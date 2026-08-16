@@ -8,7 +8,9 @@
 import io
 import os
 import sys
+import types
 import unittest
+from unittest import mock
 
 # 内嵌版 Python 的 ._pth 隔离模式不把 cwd 放进 sys.path，
 # 按本文件位置定位仓库根，保证两种解释器下都能 import python.demucs_barrier。
@@ -33,6 +35,38 @@ class DemucsBarrierTests(unittest.TestCase):
     def test_non_object_rejected(self):
         self.assertFalse(demucs_barrier.wait_for_load(io.StringIO("[]\n")))
 
+    def test_main_reconstructs_demucs_argv(self):
+        # 用假 demucs 模块记录 main() 看到的 argv：覆盖屏障指令后的
+        # argv 重组（防切片 off-by-one 类回归）
+        calls = {}
+        fake_separate = types.ModuleType("demucs.separate")
+
+        def fake_main():
+            calls["argv"] = list(sys.argv)
+
+        fake_separate.main = fake_main
+        fake_demucs = types.ModuleType("demucs")
+        fake_demucs.separate = fake_separate
+        with mock.patch.dict(
+            sys.modules, {"demucs": fake_demucs, "demucs.separate": fake_separate}
+        ), mock.patch.object(
+            sys, "argv",
+            ["demucs_barrier.py", "htdemucs", "cpu", r"C:\out", r"C:\audio.wav"],
+        ), mock.patch.object(sys, "stdin", io.StringIO('{"op": "load"}\n')):
+            demucs_barrier.main()
+        self.assertEqual(
+            calls["argv"],
+            ["demucs", "--two-stems", "vocals", "-n", "htdemucs",
+             "-d", "cpu", "-o", r"C:\out", r"C:\audio.wav"],
+        )
+
+    def test_main_short_argv_exits_usage(self):
+        with mock.patch.object(sys, "argv", ["demucs_barrier.py", "htdemucs"]):
+            with self.assertRaises(SystemExit) as ctx:
+                demucs_barrier.main()
+        self.assertEqual(ctx.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+
