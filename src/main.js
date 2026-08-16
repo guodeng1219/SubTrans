@@ -28,6 +28,9 @@ const state = {
 
 // 用户是否手动改选过人声分离模型：改选后 detectEnv 不再自动覆盖默认引擎
 let demucsModelChosen = false;
+// 接受"separate"进度事件的会话令牌：旧分离任务的残留进度（demucs 后台
+// 读行任务等）不得覆盖新任务的状态；任务结束后清空
+let sepSession = null;
 
 // 边播边译的流水线状态
 const stream = {
@@ -169,10 +172,16 @@ listen("progress", (e) => {
     setFill("#pyBarFill", pct);
     const st = $("#pyStatus");
     if (st) st.textContent = message;
-  } else if (stage === "separate" && e.payload.chunk_total != null) {
-    // 高精度人声分离结构化进度：分片 + 内存 + 降片重试（旧 separate 事件无新字段，走通用分支）
+  } else if (stage === "separate") {
+    // 分离进度必须属于当前任务：旧任务取消后残留的输出（如 demucs 后台
+    // 读行任务）不得覆盖新会话的进度与文案
+    if (state.session !== sepSession) return;
     setFill("#runFill", pct);
-    $("#runMsg").textContent = formatVocalProgress(e.payload);
+    if (e.payload?.chunk_total != null) {
+      $("#runMsg").textContent = formatVocalProgress(e.payload);
+    } else {
+      $("#runMsg").textContent = message;
+    }
   } else {
     setFill("#runFill", pct);
     $("#runMsg").textContent = message;
@@ -969,6 +978,8 @@ async function startProcess() {
 
   // 高精度模式：先用 demucs 分离人声，ASR 改用纯人声轨（播放仍用原视频）
   if ($("#hiQuality").checked) {
+    // 记录本次分离任务的会话令牌：后端进度事件只在本会话内被接受
+    sepSession = sessionAtProc;
     $("#runMsg").textContent = "高精度模式：分离人声中（首次会加载模型，请稍候）...";
     try {
       const vocals = await invoke("separate_vocals", {
@@ -980,6 +991,7 @@ async function startProcess() {
       // 分离期间会话可能已切换：过期结果/错误都不得触碰新会话状态
       if (state.session !== sessionAtProc) return;
       stream.audioSource = vocals;
+      setFill("#runFill", 100); // 后端 100% 事件可能滞后于命令返回，前端兜底一次
     } catch (err) {
       console.error("[subtrans] separate_vocals failed:", err);
       if (state.session !== sessionAtProc) return; // 过期分离的失败不改新会话状态
@@ -993,6 +1005,10 @@ async function startProcess() {
       $("#demucsStatus").textContent = `✗ 分离失败: ${err}`;
       $("#demucsStatus").style.color = "var(--danger)";
       return;
+    } finally {
+      // 本任务结束：同会话的后续分离进度不再可信（demucs 后台读行任务
+      // 的残留输出不得覆盖识别阶段的文案）
+      if (sepSession === sessionAtProc) sepSession = null;
     }
   }
 
@@ -2331,9 +2347,9 @@ async function detectEnv() {
     (env.fw_ready || env.demucs_ready || env.audio_sep_ready);
   const cudaInstalled = env.has_gpu && env.cuda_torch_ready; // CUDA torch 已装（不管 fw/demucs 检测结果）
   const fwReady = gpuReady && env.fw_ready;
-  const demucsReady = gpuReady && env.demucs_ready;
-  // 人声分离不绑定 GPU：audio-separator 在 CPU 上同样可跑（慢但可用），
-  // 只要组件就绪就显示高精度入口
+  // 人声分离不绑定 GPU：demucs / audio-separator 在 CPU 上同样可跑（慢但可用，
+  // 后端已有界执行：Job 硬限 + 内存采样 + 可取消），只要组件就绪就显示入口
+  const demucsReady = env.demucs_ready;
   const audioSepReady = env.audio_sep_ready;
   // 高精度模式只需人声分离引擎之一就绪：demucs 或 BS-RoFormer（audio-separator）
   const hiQualityReady = demucsReady || audioSepReady;

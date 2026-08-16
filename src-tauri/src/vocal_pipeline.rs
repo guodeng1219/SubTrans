@@ -36,12 +36,15 @@ pub struct VocalState {
 }
 
 impl VocalState {
-    /// 开始新任务：只分配换代令牌，**不**删除旧发布——旧人声轨仍归旧会话所有，
+    /// 开始新任务：分配换代令牌，**不**删除旧发布——旧人声轨仍归旧会话所有，
     /// 由 `cancel()`（显式丢弃）、`publish_output()`（成功发布时原子替换）或
     /// `release_output()`（归属校验后释放）负责清理。
-    /// 这样预检失败的新任务不会破坏「发布只在成功时被替换」的不变量：
-    /// 令牌先行 + 预检失败 = 旧会话的人声轨原样保留。
+    /// 仍然获取 `published_output` 锁：令牌换代与 `publish_output` 的
+    /// 「校验令牌 + 写入发布」在同一锁内线性化——旧任务不可能在
+    /// 「确认令牌有效」之后、新任务 begin() 之后还写出成功发布。
+    /// 预检失败的新任务也不会破坏「发布只在成功时被替换」的不变量。
     pub fn begin(&self) -> u64 {
+        let _guard = self.published_output.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -58,6 +61,11 @@ impl VocalState {
 
     pub fn is_cancelled(&self, token: u64) -> bool {
         self.generation.load(Ordering::SeqCst) != token
+    }
+
+    /// 当前发布的人声轨路径（用于清扫/校验时跳过仍处于发布状态的文件）。
+    pub fn published_path(&self) -> Option<PathBuf> {
+        self.published_output.lock().unwrap().clone()
     }
 
     /// 发布最终人声轨路径：令牌检查与替换发布在**同一把锁内**原子完成——
@@ -285,8 +293,14 @@ fn emit_chunk_progress(
     retrying: bool,
     warning: bool,
 ) {
-    let pct =
-        if total_frames > 0 { completed_frames as f64 / total_frames as f64 * 100.0 } else { 0.0 };
+    // 分片进度封顶 99.9%：真正的 100% 只由调用方在发布成功后发出——
+    // 最后一片完成时后面还有拼接/校验/重命名/发布，这些失败时用户
+    // 不会先看到「100% 完成」再看到失败。
+    let pct = if total_frames > 0 {
+        (completed_frames as f64 / total_frames as f64 * 100.0).min(99.9)
+    } else {
+        0.0
+    };
     emit_vocal_progress(
         app,
         pct,
@@ -369,12 +383,19 @@ async fn process_one_chunk(
     let resp = {
         let resp_future = ctx.worker.read_response(&request_id);
         tokio::pin!(resp_future);
+        // 定时器必须在循环外创建：500ms 分支总是先完成，循环内重建的 2s
+        // 定时器永远到不了——内存采样（85% 警告 / 100% 终止 / 系统余量保护）
+        // 就会整套失效。interval 在 tick 之间保持自己的调度，不受循环影响。
+        let mut memory_tick = tokio::time::interval(MEMORY_TICK);
+        memory_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut cancel_tick = tokio::time::interval(CANCEL_TICK);
+        cancel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result = loop {
             tokio::select! {
                 r = &mut resp_future => {
                     break Some(r);
                 }
-                _ = tokio::time::sleep(MEMORY_TICK) => {
+                _ = memory_tick.tick() => {
                     match ctx.probe.sample() {
                         Ok(sample) => {
                             match ctx.memory_guard.observe(sample) {
@@ -413,7 +434,7 @@ async fn process_one_chunk(
                         }
                     }
                 }
-                _ = tokio::time::sleep(CANCEL_TICK) => {
+                _ = cancel_tick.tick() => {
                     if state.is_cancelled(token) {
                         // 同上：整树终止，避免与 resp_future 的 &mut ctx.worker 借用冲突
                         ctx.job.terminate(1);

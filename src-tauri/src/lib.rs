@@ -35,6 +35,11 @@ fn whisper_model_url(name: &str) -> String {
 /// 对应 ggml-org/whisper-vad 仓库的 .bin 文件（旧的 ggerganov/whisper.cpp .onnx 已下线且格式不符）。
 const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
 
+/// 内嵌的 demucs 启动屏障脚本（编译进二进制，运行时写入临时文件）。
+/// demucs 分离路径与 BS-RoFormer worker 使用相同的 {"op":"load"} 屏障协议：
+/// Python 在收到 load 之前绝不导入/加载模型，保证 Job 内存硬限先于模型加载生效。
+const DEMUCS_BARRIER_PY: &str = include_str!("../../python/demucs_barrier.py");
+
 fn vad_model_url() -> &'static str {
     "https://hf-mirror.com/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 }
@@ -1578,7 +1583,31 @@ async fn separate_vocals_inner(
     device: String,
 ) -> Result<String, String> {
     let python_exe = if python_exe.is_empty() { resolve_python(&app) } else { python_exe };
-    check_python_path(&python_exe)?;
+
+    // ── 任务令牌与日志最先建立：在**所有异步预检与同步设置**之前占用令牌 ──
+    // 慢预检的旧请求不可能在快预检的新请求之后调用 begin() 夺取所有权；
+    // 从此处起的一切错误（含 Python 路径无效、工作目录/模型目录创建失败）
+    // 都有 task_failed 终态可查。
+    let vocal_state = app.state::<vocal_pipeline::VocalState>();
+    let token = vocal_state.begin();
+    let logger = task_log::TaskLogger::new(data_dir(&app), task_log::new_task_id(token));
+    let _ = logger.write(
+        "task_started",
+        &serde_json::json!({
+            "video": &video_path,
+            "model": &model,
+            "device": &device,
+        }),
+    );
+    // 提前失败也写失败终态
+    let fail = |code: &'static str, message: String| -> String {
+        let _ = logger.write("task_failed", &serde_json::json!({"code": code, "message": message}));
+        message
+    };
+    if let Err(e) = check_python_path(&python_exe) {
+        return Err(fail("vocal_worker_start_failed", e));
+    }
+
     // 每次分离用独立目录（带 PID + 时间戳），避免多实例/并发互相删目录；
     // 结束后把 vocals 复制到稳定路径，再清掉工作目录。
     let stamp = std::time::SystemTime::now()
@@ -1587,11 +1616,17 @@ async fn separate_vocals_inner(
         .unwrap_or(0);
     // 清理人声轨残留：本进程旧文件立即清；其它进程（上次运行）遗留的只清 24h 以上陈旧的，
     // 避免误删另一个正在运行实例正在使用的文件。
+    // 处于发布状态的文件必须跳过：新任务预检失败时应保留旧会话的输出，
+    // 不能先删文件再让 published_output 指向已不存在的路径。
+    let published = vocal_state.published_path();
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if !name.starts_with("subtrans_vocals_") || !name.ends_with(".wav") {
+                continue;
+            }
+            if published.as_ref() == Some(&entry.path()) {
                 continue;
             }
             let is_ours = name.starts_with(&format!("subtrans_vocals_{}_", std::process::id()));
@@ -1603,7 +1638,8 @@ async fn separate_vocals_inner(
         }
     }
     let work = std::env::temp_dir().join(format!("subtrans_sep_{}_{}", std::process::id(), stamp));
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&work)
+        .map_err(|e| fail("vocal_worker_start_failed", format!("创建工作目录失败: {e}")))?;
     // 工作目录含整段视频的音频（可达 GB 级），由守护对象统一清理：
     // 提取失败 / 分离失败 / 超时 / 成功等所有路径都不在 temp 里堆积大文件。
     let _work_guard = TempDirGuard(work.clone());
@@ -1619,25 +1655,10 @@ async fn separate_vocals_inner(
         .app_data_dir()
         .map(|d| d.join("models").join("audio-separator"))
         .unwrap_or_else(|_| std::env::temp_dir().join("audio-separator-models"));
-    std::fs::create_dir_all(&sep_models_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&sep_models_dir)
+        .map_err(|e| fail("vocal_worker_start_failed", format!("创建模型目录失败: {e}")))?;
 
     let is_demucs_model = model.starts_with("htdemucs") || model.starts_with("mdx_extra");
-
-    // ── 任务令牌先行：在**所有异步预检之前**占用令牌 ──
-    // 慢预检的旧请求不可能在快预检的新请求之后调用 begin() 夺取所有权：
-    // 后续请求的 begin() 会让本 token 过期，本请求预检完必须校验后放弃。
-    // 日志同样从此刻起贯穿全流程（预检失败 / demucs / BS-RoFormer 都有 task_failed 终态）。
-    let vocal_state = app.state::<vocal_pipeline::VocalState>();
-    let token = vocal_state.begin();
-    let logger = task_log::TaskLogger::new(data_dir(&app), task_log::new_task_id(token));
-    let _ = logger.write(
-        "task_started",
-        &serde_json::json!({
-            "video": &video_path,
-            "model": &model,
-            "device": &device,
-        }),
-    );
 
     if is_demucs_model {
         // 明确选择 demucs 模型：走有界执行（Job 硬限 + 内存采样 + 可取消），
@@ -1839,17 +1860,17 @@ async fn separate_demucs(
         8.0,
         &format!("分离人声中（demucs {demucs_model}, {device}）..."),
     );
+    // 启动屏障：与 BS-RoFormer worker 相同的 load 协议。包装脚本在收到
+    // {"op":"load"} 之前绝不导入 demucs / 加载模型，因此「Job 绑定先于
+    // 模型加载」是协议保证，而不是 spawn → 取 PID → 绑 Job 的竞态侥幸。
+    let barrier_path = work.join("demucs_barrier.py");
+    std::fs::write(&barrier_path, DEMUCS_BARRIER_PY)
+        .map_err(|e| format!("写入 demucs 启动屏障脚本失败: {e}"))?;
     let mut command = TokioCommand::new(python_exe);
     command.args([
-        "-m",
-        "demucs",
-        "--two-stems",
-        "vocals",
-        "-n",
+        barrier_path.to_str().ok_or("屏障脚本路径无效")?,
         demucs_model,
-        "-d",
         device,
-        "-o",
         out_dir.to_str().ok_or("输出路径无效")?,
         audio.to_str().ok_or("音频路径无效")?,
     ]);
@@ -1858,6 +1879,7 @@ async fn separate_demucs(
         // demucs 模型从 HuggingFace 下载（adefossez/HTDemucs），
         // 不设镜像会去连主站（国内常不可达）→ 首次分离必失败
         .env("HF_ENDPOINT", "https://hf-mirror.com")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -1868,7 +1890,6 @@ async fn separate_demucs(
     let mut child = command
         .spawn()
         .map_err(|e| format!("启动 demucs 失败: {e}（请确认已 pip install demucs）"))?;
-    // 硬限先于模型加载：spawn 后立即绑 Job，demucs 加载/推理全程受 115% 软预算约束
     let pid = child.id().ok_or("demucs 进程无 PID")?;
     let mut probe = crate::process_memory::ProcessMemoryProbe::new(pid);
     let budget = crate::process_memory::effective_memory_budget_bytes(probe.total_physical_bytes());
@@ -1880,6 +1901,20 @@ async fn separate_demucs(
         }
     };
     let mut memory_guard = crate::process_memory::MemoryGuard::new(budget);
+
+    // Job 已绑定：现在才放行模型加载
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().ok_or("无法获取 demucs stdin")?;
+        let mut load_ok = stdin.write_all(b"{\"op\":\"load\"}\n").await;
+        if load_ok.is_ok() {
+            load_ok = stdin.flush().await;
+        }
+        if load_ok.is_err() {
+            let _ = child.start_kill();
+            return Err("写入 demucs 加载指令失败（进程可能已退出）".to_string());
+        }
+    } // stdin 句柄在此关闭：屏障脚本已消费 load 行，demucs main() 不读 stdin
 
     // 读取 stdout+stderr 实时转发进度
     let tail = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
@@ -1915,14 +1950,20 @@ async fn separate_demucs(
     }
 
     // 分离可能很慢（长视频 + CPU）：2 小时死线 + 2 秒内存采样 + 500ms 取消轮询。
-    // 超限/取消/超时都先终止整棵进程树（Job），绝不留下可叠加内存的孤儿进程。
+    // 定时器必须在循环外创建（interval）：500ms 分支总是先完成，循环内重建的
+    // 2 秒定时器永远到不了，内存采样就会整套失效。超限/取消/超时都先终止
+    // 整棵进程树（Job），绝不留下可叠加内存的孤儿进程。
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
     let wait_future = child.wait();
     tokio::pin!(wait_future);
+    let mut memory_tick = tokio::time::interval(MEMORY_TICK);
+    memory_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut cancel_tick = tokio::time::interval(CANCEL_TICK);
+    cancel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let status = loop {
         tokio::select! {
             r = &mut wait_future => break r,
-            _ = tokio::time::sleep(MEMORY_TICK) => {
+            _ = memory_tick.tick() => {
                 if let Ok(sample) = probe.sample() {
                     if memory_guard.observe(sample)
                         == crate::process_memory::MemoryDecision::Exceeded
@@ -1935,7 +1976,7 @@ async fn separate_demucs(
                     }
                 }
             }
-            _ = tokio::time::sleep(CANCEL_TICK) => {
+            _ = cancel_tick.tick() => {
                 if state.is_cancelled(token) {
                     job.terminate(1);
                     return Err("任务已取消".to_string());
