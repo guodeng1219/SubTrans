@@ -58,10 +58,11 @@ jobs:
         run: cargo test
         working-directory: src-tauri
 
+      - name: 安装前端依赖
+        run: npm ci
+
       - name: 前端单元测试
-        run: |
-          npm ci
-          npm run test:frontend
+        run: npm run test:frontend
 
       # Python 协议测试：fw/vocal 服务 + demucs 启动屏障（含 argv 重组回归测试）。
       # 参数错位这类问题必须在发布前被抓住，而不是进入安装包。
@@ -80,9 +81,6 @@ jobs:
           $PY python/test_fw_server.py
           $PY python/test_vocal_server.py
           $PY python/test_demucs_barrier.py
-
-      - name: 安装前端依赖
-        run: npm ci
 
       - name: 编译并打包
         uses: tauri-apps/tauri-action@v0

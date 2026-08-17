@@ -9,6 +9,20 @@ export function formatBytesGiB(bytes) {
 }
 
 /**
+ * 分离进度事件过滤：当前任务 id 为空、事件未携带 id、或 id 不匹配时丢弃。
+ * 取消任务 A 后（currentTaskId 置 null），A 的残留进度（如 Demucs 后台
+ * 读行任务在退出前发出的最后几行）必须被丢弃，不得更新新任务的 UI。
+ *
+ * @param {string|null} currentTaskId 当前分离任务的 request_id（取消后为 null）
+ * @param {object} payload 后端 progress 事件的 payload
+ * @returns {boolean} 是否接受该事件
+ */
+export function shouldAcceptSeparateProgress(currentTaskId, payload) {
+  if (!currentTaskId) return false;
+  return payload?.task_id === currentTaskId;
+}
+
+/**
  * 人声分离进度文本：分片消息 + 内存占用；降片重试时明确解释进度变化原因，
  * 不伪装成普通进度回退。
  *

@@ -9,7 +9,7 @@ import {
   applyDetectedProfileForSession,
   resolveRecognitionSettingsAfterCatalog,
 } from "./recognition-profile-state.js";
-import { formatVocalProgress } from "./vocal-progress.js";
+import { formatVocalProgress, shouldAcceptSeparateProgress } from "./vocal-progress.js";
 
 // ───────── 简易本地配置（仅记一个"是否完成向导"标记） ─────────
 const SETUP_KEY = "subtrans.setupDone";
@@ -176,7 +176,7 @@ listen("progress", (e) => {
   } else if (stage === "separate") {
     // 分离进度必须属于当前任务：按 request_id 严格匹配，旧任务残留的
     // stdout 事件（如取消后的 Demucs 后台读行）直接丢弃
-    if (!sepTaskId || e.payload?.task_id !== sepTaskId) return;
+    if (!shouldAcceptSeparateProgress(sepTaskId, e.payload)) return;
     setFill("#runFill", pct);
     if (e.payload?.chunk_total != null) {
       $("#runMsg").textContent = formatVocalProgress(e.payload);
@@ -653,6 +653,9 @@ async function openVideo() {
   // 先提交未完成的行内编辑（对象已脱离数组，直接丢弃）；再落盘当前会话草稿
   commitInlineEdit();
   await saveAutosave();
+  // 立即作废当前分离任务 id：旧任务（如 Demucs 后台读行）在彻底退出前
+  // 发出的残留进度一律丢弃，不得覆盖接下来打开的新视频页面状态
+  sepTaskId = null;
   // 取消可能仍在运行的高精度人声分离（杀 Python/FFmpeg、清理临时人声轨）
   await invoke("cancel_vocal_separation").catch(() => {});
   // 切换视频前停掉旧流水线，避免旧任务继续往新列表里塞字幕
@@ -929,6 +932,9 @@ function updateStatus(res) {
 
 async function startProcess() {
   if (!state.videoPath) return;
+  // 立即作废旧任务 id：取消窗口期（含下面最长 15 秒的元数据等待）内，
+  // 旧任务残留进度不得通过 id 检查覆盖新会话状态
+  sepTaskId = null;
   // 取消上一次会话可能仍在运行的高精度人声分离（新会话重新开始）
   await invoke("cancel_vocal_separation").catch(() => {});
   state.session++; // 新一轮识别：上一次运行的在飞分片立即过期（同一视频重复点开始同理）
@@ -1732,6 +1738,8 @@ async function openProjectDialog() {
     filters: [{ name: "SubTrans 项目", extensions: ["subtrans", "json"] }],
   });
   if (!path) return;
+  // 立即作废旧任务 id：打开项目期间旧分离任务的残留进度不得覆盖新页面状态
+  sepTaskId = null;
   // 取消可能仍在运行的高精度人声分离
   await invoke("cancel_vocal_separation").catch(() => {});
   try {
