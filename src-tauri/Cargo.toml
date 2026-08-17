@@ -33,6 +33,14 @@ futures-util = "0.3"
 # 人声分离 worker 进程树内存采样与 Windows Job Object 硬限
 sysinfo = "0.33"
 
+# 错误处理 / 路径 / 音频 / 字幕后处理等通用依赖（全平台）
+anyhow = "1"
+dirs = "5"
+hound = "3.5"             # WAV 读取（喂给 whisper）
+regex = "1"               # 字幕文本后处理
+ferrous-opencc = "0.4"    # 简体→繁体转换（纯 Rust，字典内嵌，导出繁体字幕）
+base64 = "0.22"           # 波形数据编码（前端 canvas 绘制）
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
@@ -40,13 +48,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_ProcessStatus",
   "Win32_System_Threading",
 ] }
-
-anyhow = "1"
-dirs = "5"
-hound = "3.5"             # WAV 读取（喂给 whisper）
-regex = "1"               # 字幕文本后处理
-ferrous-opencc = "0.4"    # 简体→繁体转换（纯 Rust，字典内嵌，导出繁体字幕）
-base64 = "0.22"           # 波形数据编码（前端 canvas 绘制）
 
 [features]
 # 默认 CPU。需要 GPU 加速时按平台开启对应 feature 编译：

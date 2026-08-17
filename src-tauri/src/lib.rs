@@ -2698,10 +2698,6 @@ async fn upgrade_cuda(app: tauri::AppHandle, python_exe: String) -> Result<Strin
 }
 
 async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result<String, String> {
-    let python_exe = if python_exe.is_empty() { resolve_python(&app) } else { python_exe };
-    if python_exe.is_empty() {
-        return Err("未找到 Python 路径".into());
-    }
     #[cfg(target_os = "macos")]
     {
         // cu124 轮子没有 macOS 版：此命令在 macOS 上必然失败，直接给出明确提示，
@@ -2709,6 +2705,20 @@ async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result
         return Err(
             "当前平台不支持一键安装 CUDA 版 torch（仅 Windows/Linux 提供 cu124 镜像）".into()
         );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        upgrade_cuda_impl(app, python_exe).await
+    }
+}
+
+/// Windows/Linux 实现：卸载 CPU 版 torch → 依次尝试 CUDA 镜像 → 失败回退 CPU 版。
+/// macOS 没有 cu124 轮子，此函数在 macOS 上不编译（见 upgrade_cuda_inner 的早退提示）。
+#[cfg(not(target_os = "macos"))]
+async fn upgrade_cuda_impl(app: tauri::AppHandle, python_exe: String) -> Result<String, String> {
+    let python_exe = if python_exe.is_empty() { resolve_python(&app) } else { python_exe };
+    if python_exe.is_empty() {
+        return Err("未找到 Python 路径".into());
     }
     // 确保 pip 可用（embeddable/精简 Python 可能没装 pip）
     python_setup::ensure_pip(std::path::Path::new(&python_exe), &std::env::temp_dir()).await?;
