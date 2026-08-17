@@ -17,12 +17,15 @@ jobs:
           # macOS Apple Silicon
           - platform: "macos-latest"
             args: "--target aarch64-apple-darwin"
+            arch: "aarch64"
           # macOS Intel
           - platform: "macos-latest"
             args: "--target x86_64-apple-darwin"
+            arch: "x64"
           # Windows x64
           - platform: "windows-latest"
             args: ""
+            arch: "x64"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -81,6 +84,24 @@ jobs:
           $PY python/test_fw_server.py
           $PY python/test_vocal_server.py
           $PY python/test_demucs_barrier.py
+
+      # GitHub 不允许同名覆盖 release 资产：修复构建失败后重跑 workflow 时，同一
+      # draft release 里仍留着上次上传的同名资产，tauri-action 上传会报 422
+      # already_exists。先删掉本腿将上传的同名旧资产（三条腿资产名互不相同，互不影响）。
+      - name: 清理同名旧资产
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRODUCT=$(node -p "require('./src-tauri/tauri.conf.json').productName")
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          case "${{ matrix.platform }}" in
+            windows-latest) ASSET="${PRODUCT}_${VERSION}_${{ matrix.arch }}-setup.exe" ;;
+            macos-latest)   ASSET="${PRODUCT}_${VERSION}_${{ matrix.arch }}.dmg" ;;
+          esac
+          echo "release: ${{ github.ref_name }} / asset: $ASSET"
+          gh release delete-asset "${{ github.ref_name }}" "$ASSET" -y 2>/dev/null \
+            || echo "no existing asset, skip"
 
       - name: 编译并打包
         uses: tauri-apps/tauri-action@v0
