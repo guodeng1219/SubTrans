@@ -11,6 +11,7 @@ fn download_ffmpeg_if_missing() {
     let ext = if target.contains("windows") { ".exe" } else { "" };
     let name = format!("ffmpeg-{target}{ext}");
     let dest = PathBuf::from("binaries").join(&name);
+    #[cfg(target_os = "windows")]
     let ffprobe_dest = PathBuf::from("binaries").join(format!("ffprobe-{target}{ext}"));
 
     // Windows 需要 ffmpeg+ffprobe 双 sidecar；macOS 的 ffmpeg-static 单文件不包含 ffprobe，
@@ -202,6 +203,7 @@ fn find_powershell() -> String {
     "powershell".to_string()
 }
 
+#[cfg(target_os = "windows")]
 fn find_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {

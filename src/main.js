@@ -1736,7 +1736,7 @@ async function restoreAutosave() {
 async function saveProjectDialog() {
   const path = await saveDialog({
     defaultPath: "subtrans-project.subtrans",
-    filters: [{ name: "SubTrans 项目", extensions: ["subtrans", "json"] }],
+    filters: [{ name: "译幕项目", extensions: ["subtrans", "json"] }],
   });
   if (!path) return;
   try {
@@ -1749,7 +1749,7 @@ async function saveProjectDialog() {
 
 async function openProjectDialog() {
   const path = await openDialog({
-    filters: [{ name: "SubTrans 项目", extensions: ["subtrans", "json"] }],
+    filters: [{ name: "译幕项目", extensions: ["subtrans", "json"] }],
   });
   if (!path) return;
   // 立即作废旧任务 id：打开项目期间旧分离任务的残留进度不得覆盖新页面状态
