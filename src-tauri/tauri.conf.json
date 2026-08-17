@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "字幕翻译工具",
+  "productName": "译幕",
   "version": "0.1.0",
   "identifier": "com.subtrans.desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "SubTrans",
+        "title": "译幕",
         "width": 1200,
         "height": 800,
         "minWidth": 1000,
