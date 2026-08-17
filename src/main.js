@@ -1047,6 +1047,8 @@ async function startProcess() {
   try {
     await video.play();
   } catch {}
+  // play 期间会话可能已切换：过期流程不得启动 pump（最后一个 await 之后的校验）
+  if (startFlowExpired(sessionAtProc, state)) return;
   pump(); // 不 await，后台持续处理
 }
 
