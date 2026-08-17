@@ -87,21 +87,50 @@ jobs:
 
       # GitHub 不允许同名覆盖 release 资产：修复构建失败后重跑 workflow 时，同一
       # draft release 里仍留着上次上传的同名资产，tauri-action 上传会报 422
-      # already_exists。先删掉本腿将上传的同名旧资产（三条腿资产名互不相同，互不影响）。
+      # already_exists。这里直接调 REST API，把本腿将上传的同名旧资产删掉
+      # （按 产品_版本_架构 模式匹配，三条腿互不重叠，并行跑不会互删）。
       - name: 清理同名旧资产
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -uo pipefail
           PRODUCT=$(node -p "require('./src-tauri/tauri.conf.json').productName")
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="${{ github.ref_name }}"
           case "${{ matrix.platform }}" in
-            windows-latest) ASSET="${PRODUCT}_${VERSION}_${{ matrix.arch }}-setup.exe" ;;
-            macos-latest)   ASSET="${PRODUCT}_${VERSION}_${{ matrix.arch }}.dmg" ;;
+            windows-latest) EXT="setup.exe" ;;
+            macos-latest)   EXT="dmg" ;;
           esac
-          echo "release: ${{ github.ref_name }} / asset: $ASSET"
-          gh release delete-asset "${{ github.ref_name }}" "$ASSET" -y 2>/dev/null \
-            || echo "no existing asset, skip"
+          pattern="${PRODUCT}_${VERSION}_${{ matrix.arch }}.*${EXT}"
+          echo "cleanup: release tag=${TAG} pattern=${pattern}"
+          rel=$(curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            || echo "")
+          release_id=$(echo "$rel" | jq -r '.id // empty' 2>/dev/null)
+          if [ -z "$release_id" ]; then
+            echo "cleanup: release not found yet, nothing to delete"
+            exit 0
+          fi
+          curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+            | jq -r '.[] | [.id, .name] | @tsv' \
+            | while IFS=$'\t' read -r id name; do
+                case "$name" in
+                  ${pattern})
+                    echo "cleanup: deleting stale asset id=${id} name=${name}"
+                    curl -sS -o /dev/null -w "cleanup:   http %{http_code}\n" -X DELETE \
+                      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                      -H "Accept: application/vnd.github+json" \
+                      "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
+                    ;;
+                esac
+              done
+          echo "cleanup: done"
 
       - name: 编译并打包
         uses: tauri-apps/tauri-action@v0
