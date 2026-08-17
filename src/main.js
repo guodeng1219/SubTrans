@@ -10,6 +10,7 @@ import {
   resolveRecognitionSettingsAfterCatalog,
 } from "./recognition-profile-state.js";
 import { formatVocalProgress, shouldAcceptSeparateProgress } from "./vocal-progress.js";
+import { captureStartSession, startFlowExpired } from "./start-guard.js";
 
 // ───────── 简易本地配置（仅记一个"是否完成向导"标记） ─────────
 const SETUP_KEY = "subtrans.setupDone";
@@ -932,12 +933,22 @@ function updateStatus(res) {
 
 async function startProcess() {
   if (!state.videoPath) return;
-  // 立即作废旧任务 id：取消窗口期（含下面最长 15 秒的元数据等待）内，
-  // 旧任务残留进度不得通过 id 检查覆盖新会话状态
+  // 入口防重入：快速双击/元数据等待期间再次点击都直接返回，
+  // 不可能产生两个并行的启动流程（共享同一会话号会绕过全部过期检查）
+  const startBtn = $("#startBtn");
+  if (startBtn.disabled) return;
+  startBtn.disabled = true;
+
+  // 会话令牌必须在**任何异步等待之前**捕获：下面的 cancel 等待与最长 15 秒的
+  // 元数据等待期间，打开新视频/打开项目/再次点击开始都会让本调用过期；
+  // 恢复后对照这份捕获值判定，过期流程不得调用分离、修改 stream。
+  // （此前在等待之后才读取 state.session，会把新会话误当成本会话）
   sepTaskId = null;
+  const sessionAtProc = captureStartSession(state);
+
   // 取消上一次会话可能仍在运行的高精度人声分离（新会话重新开始）
   await invoke("cancel_vocal_separation").catch(() => {});
-  state.session++; // 新一轮识别：上一次运行的在飞分片立即过期（同一视频重复点开始同理）
+  if (startFlowExpired(sessionAtProc, state)) return;
   const video = $("#video");
   if (!video.duration || isNaN(video.duration)) {
     // 等待元数据加载，带超时避免损坏视频导致 UI 卡死
@@ -945,19 +956,20 @@ async function startProcess() {
       new Promise((res) => video.addEventListener("loadedmetadata", () => res(true), { once: true })),
       new Promise((res) => setTimeout(() => res(false), 15000)),
     ]);
+    // 等待期间可能已切换会话/视频：过期调用绝不触碰新会话状态
+    if (startFlowExpired(sessionAtProc, state)) return;
     if (!ok || !video.duration || isNaN(video.duration)) {
       $("#runMsg").textContent = "无法读取视频时长（文件可能损坏或格式不支持）";
+      $("#startBtn").disabled = false;
       return;
     }
   }
   state.subtitles = [];
   renderSubList();
   resetUndo(); // 新一轮识别：旧字幕/旧撤销历史全部作废
-  $("#startBtn").disabled = true;
   $("#exportBtn").disabled = true;
   setFill("#runFill", 0);
 
-  const sessionAtProc = state.session; // 本次启动归属的会话：中途切换则静默放弃
   Object.assign(stream, {
     chunkLen: 120,
     readyUntil: 0,
@@ -987,7 +999,7 @@ async function startProcess() {
   if ($("#hiQuality").checked) {
     // 为本次任务生成唯一 request_id：后端所有 separate 进度事件携带它，
     // 前端只接受匹配事件（旧任务残留输出按 id 丢弃，不靠会话猜测）
-    const taskId = `sep-${sessionAtProc}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const taskId = `sep-${sessionAtProc.session}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     sepTaskId = taskId;
     $("#runMsg").textContent = "高精度模式：分离人声中（首次会加载模型，请稍候）...";
     try {
@@ -999,12 +1011,12 @@ async function startProcess() {
         taskId,
       });
       // 分离期间会话可能已切换：过期结果/错误都不得触碰新会话状态
-      if (state.session !== sessionAtProc) return;
+      if (startFlowExpired(sessionAtProc, state)) return;
       stream.audioSource = vocals;
       setFill("#runFill", 100); // 后端 100% 事件可能滞后于命令返回，前端兜底一次
     } catch (err) {
       console.error("[subtrans] separate_vocals failed:", err);
-      if (state.session !== sessionAtProc) return; // 过期分离的失败不改新会话状态
+      if (startFlowExpired(sessionAtProc, state)) return; // 过期分离的失败不改新会话状态
       // 高精度分离失败：停止识别（绝不静默回退普通音频或 Demucs）。
       // 不取消用户的高精度勾选，用户可查看错误、调整设置后重试。
       stream.running = false;
@@ -1025,7 +1037,7 @@ async function startProcess() {
   // 先处理头一片，再开播 + 启动后台连续流水线
   $("#runMsg").textContent = `处理第一段（约${Math.round(stream.chunkLen / 60)}分钟）...`;
   const ms = await processNextChunk();
-  if (state.session !== sessionAtProc) return; // 处理期间已切换会话：不播放、不起流水线
+  if (startFlowExpired(sessionAtProc, state)) return; // 处理期间已切换会话：不播放、不起流水线
   if (ms !== null && ms > stream.chunkLen * 1000) {
     // 处理耗时超过分片时长（慢于实时）→ 后续改更小分片
     stream.smallSlices = true;
