@@ -2697,19 +2697,16 @@ async fn upgrade_cuda(app: tauri::AppHandle, python_exe: String) -> Result<Strin
     res
 }
 
+/// macOS 没有 cu124 轮子：此命令在 macOS 上必然失败，直接给出明确提示，
+/// 而不是走完三个镜像后报"回退 CPU 版"误导用户。
+#[cfg(target_os = "macos")]
+async fn upgrade_cuda_inner(_app: tauri::AppHandle, _python_exe: String) -> Result<String, String> {
+    Err("当前平台不支持一键安装 CUDA 版 torch（仅 Windows/Linux 提供 cu124 镜像）".into())
+}
+
+#[cfg(not(target_os = "macos"))]
 async fn upgrade_cuda_inner(app: tauri::AppHandle, python_exe: String) -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        // cu124 轮子没有 macOS 版：此命令在 macOS 上必然失败，直接给出明确提示，
-        // 而不是走完三个镜像后报"回退 CPU 版"误导用户
-        return Err(
-            "当前平台不支持一键安装 CUDA 版 torch（仅 Windows/Linux 提供 cu124 镜像）".into()
-        );
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        upgrade_cuda_impl(app, python_exe).await
-    }
+    upgrade_cuda_impl(app, python_exe).await
 }
 
 /// Windows/Linux 实现：卸载 CPU 版 torch → 依次尝试 CUDA 镜像 → 失败回退 CPU 版。

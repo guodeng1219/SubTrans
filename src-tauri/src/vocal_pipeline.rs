@@ -696,6 +696,9 @@ pub async fn run_bounded_vocal_pipeline(
         let job_peak = ctx.job.peak_job_memory_bytes().ok();
         peak_private = peak_private.max(ctx.memory_guard.peak_private_bytes());
         ctx.worker.shutdown().await;
+        // Windows：显式关闭 Job 句柄（KILL_ON_JOB_CLOSE 会清掉整棵进程树）。
+        // 非 Windows 的 JobGuard 是空壳（无 Drop 实现），无需也不能 drop。
+        #[cfg(target_os = "windows")]
         drop(ctx.job);
         let _ = logger.write(
             "attempt_finished",
